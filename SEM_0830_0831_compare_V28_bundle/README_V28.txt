@@ -1,15 +1,16 @@
-SEM Before/After Compare V27 - V25 only
+SEM Before/After Compare V28 - V25 only
 ========================================
 
 主程序：
-  sem_before_after_compare_0831_V27_V25only.py
+  sem_before_after_compare_0831_V28_V25only.py
 
 特点
 ----
 1. 单文件独立运行；V25算法已经完整包含在本文件中。
 2. 不加载 sem_cd_measure_200k_batch_V1_6.py。
 3. 只处理两个根目录下的 10、11、12、13、14 子文件夹。
-4. 每个目标子文件夹的 tif/tiff 数量不限，只要求 before/after 对应子文件夹内数量一致。
+4. 支持 tif、tiff、png、jpg、jpeg，扩展名不区分大小写，可混合使用。
+   每个目标子文件夹的图片数量不限，只要求 before/after 对应子文件夹内数量一致。
    每边分别按文件名自然数字顺序排列（例如 1、2、10），按相同位置一一配对。
    图案排列沿用原规则，按 trench、slot、via 循环，Region 从 2 开始递增：
      1: Region 2 trench
@@ -28,8 +29,10 @@ SEM Before/After Compare V27 - V25 only
    不同 condition 可有不同照片数量，例如 10 文件夹为 8 张、11 文件夹为 12 张。
    对应两边数量不一致或缺少文件夹时，跳过该 condition 的前后两组并记录错误，
    其他数量一致的 condition 继续处理；两边都为空时无照片可处理。
-   数量校验仅统计当前子文件夹内的 tif/tiff（扩展名不区分大小写），不计 TXT 等文件。
-5. 每张 TIF 独立读取同名 TXT 中 PixelSize=<number>。
+   数量校验仅统计当前子文件夹内的上述图片格式，不计 TXT 等文件或嵌套文件夹。
+   前后对应图片的格式可以不同，例如 before 为 PNG、after 为 JPG。
+5. 每张图片独立读取同名 TXT 中 PixelSize=<number>。
+   例如 image_1.png / image_1.jpg / image_1.tif 均对应 image_1.txt。
 6. before/after 按 Condition + 自然排序位置配对，不要求文件名相同；
    Region + Pattern 由排序位置生成。两边照片应保持相同拍摄顺序及图案排列。
 7. trench/slot/via 的识别、边缘、QC、点阵/列规则与 zero-result fallback 全部使用 V25。
@@ -49,7 +52,7 @@ C:\Users\z00027644\Documents\倾斜刻蚀\SEM\0831SEM_10-14_topview_after
 
 默认输出
 --------
-C:\Users\z00027644\Documents\倾斜刻蚀\SEM\SEM_0830_0831_compare_V27
+C:\Users\z00027644\Documents\倾斜刻蚀\SEM\SEM_0830_0831_compare_V28
 
 安装依赖
 --------
@@ -57,20 +60,20 @@ pip install numpy pandas scipy opencv-python matplotlib openpyxl
 
 运行
 ----
-python sem_before_after_compare_0831_V27_V25only.py
+python sem_before_after_compare_0831_V28_V25only.py
 
 指定前后及输出目录：
-python sem_before_after_compare_0831_V27_V25only.py --before "D:/SEM/before" --after "D:/SEM/after" --output "D:/SEM/compare_output"
+python sem_before_after_compare_0831_V28_V25only.py --before "D:/SEM/before" --after "D:/SEM/after" --output "D:/SEM/compare_output"
 
 强制 via40：
-python sem_before_after_compare_0831_V27_V25only.py --via-pattern via40
+python sem_before_after_compare_0831_V28_V25only.py --via-pattern via40
 
 强制 via60：
-python sem_before_after_compare_0831_V27_V25only.py --via-pattern via60
+python sem_before_after_compare_0831_V28_V25only.py --via-pattern via60
 
 主要输出
 --------
-SEM_0830_0831_before_after_V27_results.xlsx
+SEM_0830_0831_before_after_V28_results.xlsx
 inventory_mapping.csv
 image_status.csv
 all_object_measurements.csv

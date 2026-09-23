@@ -9,8 +9,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'SEM_0830_0831_compare_V27_bundle'))
-import sem_before_after_compare_0831_V27_V25only as sem
+sys.path.insert(0, str(ROOT / 'SEM_0830_0831_compare_V28_bundle'))
+import sem_before_after_compare_0831_V28_V25only as sem
 
 
 class InventoryTests(unittest.TestCase):
@@ -38,7 +38,7 @@ class InventoryTests(unittest.TestCase):
                 condition = str(100 + count)
                 self.make_images(self.before, condition, count)
                 self.make_images(self.after, condition, count, prefix='different')
-                inv, errors = sem._v27_build_inventory(self.before, self.after, [condition])
+                inv, errors = sem._v28_build_inventory(self.before, self.after, [condition])
                 self.assertTrue(errors.empty, errors.to_dict('records'))
                 self.assertEqual(len(inv), count * 2)
                 if count:
@@ -51,7 +51,7 @@ class InventoryTests(unittest.TestCase):
     def test_original_nine_positions_are_preserved_and_extended(self):
         self.make_images(self.before, '10', 11)
         self.make_images(self.after, '10', 11)
-        inv, errors = sem._v27_build_inventory(self.before, self.after, ['10'])
+        inv, errors = sem._v28_build_inventory(self.before, self.after, ['10'])
         before = inv[inv['stage'] == 'before'].sort_values('sequence_index')
         self.assertEqual(list(zip(before['region'], before['pattern'])), [
             (2, 'trench'), (2, 'slot'), (2, 'via'),
@@ -60,19 +60,19 @@ class InventoryTests(unittest.TestCase):
             (5, 'trench'), (5, 'slot'),
         ])
 
-    def test_natural_order_mixed_tif_extensions_and_different_filenames(self):
-        before_names = ['scan_1.TIF', 'scan_2.tiff', 'scan_10.TIFF']
-        after_names = ['result_4.tif', 'result_8.TIFF', 'result_20.tiff']
+    def test_natural_order_mixed_image_formats_and_different_filenames(self):
+        before_names = ['scan_1.TIF', 'scan_2.png', 'scan_3.JPG', 'scan_10.jpeg', 'scan_11.tiff']
+        after_names = ['result_4.jpg', 'result_8.TIFF', 'result_9.JPEG', 'result_20.PNG', 'result_21.tif']
         before_folder = self.make_images(self.before, '10', 3, names=before_names)
         self.make_images(self.after, '10', 3, names=after_names)
-        (before_folder / 'preview.png').touch()
+        (before_folder / 'notes.csv').touch()
         (before_folder / 'notes.txt').touch()
         nested = before_folder / 'nested'
         nested.mkdir()
         (nested / 'extra.tif').touch()
-        inv, errors = sem._v27_build_inventory(self.before, self.after, ['10'])
+        inv, errors = sem._v28_build_inventory(self.before, self.after, ['10'])
         self.assertTrue(errors.empty)
-        self.assertEqual(len(inv), 6)
+        self.assertEqual(len(inv), 10)
         for stage, expected in [('before', before_names), ('after', after_names)]:
             self.assertEqual(inv[inv['stage'] == stage].sort_values('sequence_index')['image'].tolist(), expected)
 
@@ -85,7 +85,7 @@ class InventoryTests(unittest.TestCase):
             self.make_images(self.after, condition, acount)
         self.make_images(self.before, '14', 12)
         self.make_images(self.after, '14', 12)
-        inv, errors = sem._v27_build_inventory(self.before, self.after, conditions + ['14'])
+        inv, errors = sem._v28_build_inventory(self.before, self.after, conditions + ['14'])
         self.assertEqual(set(inv['condition']), {'14'})
         self.assertEqual(len(inv), 24)
         self.assertEqual(errors['error_type'].tolist(), ['IMAGE_COUNT_MISMATCH'] * 4)
@@ -94,7 +94,7 @@ class InventoryTests(unittest.TestCase):
     def test_missing_folder_does_not_leave_one_sided_inventory(self):
         self.make_images(self.before, '10', 10)
         self.make_images(self.after, '11', 0)
-        inv, errors = sem._v27_build_inventory(self.before, self.after, ['10', '11'])
+        inv, errors = sem._v28_build_inventory(self.before, self.after, ['10', '11'])
         self.assertTrue(inv.empty)
         self.assertEqual(errors['error_type'].tolist(), ['MISSING_CONDITION_FOLDER'] * 2)
 
@@ -102,7 +102,7 @@ class InventoryTests(unittest.TestCase):
         folder = self.make_images(self.before, '10', 10)
         self.make_images(self.after, '10', 10)
         (folder / 'image_10.txt').unlink()
-        inv, errors = sem._v27_build_inventory(self.before, self.after, ['10'])
+        inv, errors = sem._v28_build_inventory(self.before, self.after, ['10'])
         self.assertEqual(len(inv), 20)
         self.assertEqual(errors['error_type'].tolist(), ['PIXELSIZE_PREFLIGHT_ERROR'])
         self.assertEqual(errors.iloc[0]['image'], 'image_10.tif')
@@ -113,24 +113,87 @@ class InventoryTests(unittest.TestCase):
         output = self.root / 'output'
         with contextlib.redirect_stdout(io.StringIO()), patch.object(sem, '_process_one_image_v19') as process:
             with self.assertRaisesRegex(RuntimeError, '照片数量是否一致'):
-                sem.main_v27(self.before, self.after, output, conditions=['10'])
+                sem.main_v28(self.before, self.after, output, conditions=['10'])
             process.assert_not_called()
         errors = sem.pd.read_csv(output / 'processing_errors.csv')
         self.assertEqual(errors.iloc[0]['error_type'], 'IMAGE_COUNT_MISMATCH')
         self.assertEqual(errors.iloc[0]['before_count'], 10)
         self.assertEqual(errors.iloc[0]['after_count'], 9)
 
+    def test_png_and_jpg_only_folders_pair_without_tifs(self):
+        self.make_images(self.before, '10', 12, names=[f'image_{i}.PNG' for i in range(1, 13)])
+        self.make_images(self.after, '10', 12, names=[f'result_{i}.jpg' for i in range(1, 13)])
+        inv, errors = sem._v28_build_inventory(self.before, self.after, ['10'])
+        self.assertTrue(errors.empty)
+        self.assertEqual(len(inv), 24)
+        self.assertEqual(inv['pair_key'].nunique(), 12)
+        self.assertTrue((inv.groupby('pair_key')['stage'].nunique() == 2).all())
+
+    def test_extra_png_counts_toward_a_mismatch(self):
+        folder = self.make_images(self.before, '10', 9)
+        self.make_images(self.after, '10', 9)
+        (folder / 'image_10.PNG').touch()
+        (folder / 'image_10.txt').write_text('PixelSize=0.8', encoding='utf-8')
+        inv, errors = sem._v28_build_inventory(self.before, self.after, ['10'])
+        self.assertTrue(inv.empty)
+        self.assertEqual(errors['error_type'].tolist(), ['IMAGE_COUNT_MISMATCH'])
+        self.assertEqual(errors.iloc[0]['before_count'], 10)
+        self.assertEqual(errors.iloc[0]['after_count'], 9)
+
+    def test_same_stem_different_formats_sort_deterministically(self):
+        names = ['image_1.png', 'image_1.jpg', 'image_2.tif']
+        self.make_images(self.before, '10', 3, names=names)
+        self.make_images(self.after, '10', 3, names=list(reversed(names)))
+        inv, errors = sem._v28_build_inventory(self.before, self.after, ['10'])
+        self.assertTrue(errors.empty)
+        for stage in ('before', 'after'):
+            ordered = inv[inv['stage'] == stage].sort_values('sequence_index')
+            self.assertEqual(ordered['image'].tolist(), ['image_1.jpg', 'image_1.png', 'image_2.tif'])
+
+    def test_png_still_requires_matching_pixel_size_txt(self):
+        folder = self.make_images(self.before, '10', 1, names=['photo.PNG'])
+        self.make_images(self.after, '10', 1, names=['result.jpg'])
+        (folder / 'photo.txt').unlink()
+        inv, errors = sem._v28_build_inventory(self.before, self.after, ['10'])
+        self.assertEqual(len(inv), 2)
+        self.assertEqual(errors['error_type'].tolist(), ['PIXELSIZE_PREFLIGHT_ERROR'])
+        self.assertEqual(errors.iloc[0]['image'], 'photo.PNG')
+
+    def test_real_image_decoding_and_metadata_for_all_formats(self):
+        folder = self.root / '中文 图片'
+        folder.mkdir()
+        gray = sem.np.arange(32 * 48, dtype=sem.np.uint16).reshape(32, 48)
+        gray8 = (gray % 256).astype(sem.np.uint8)
+        color = sem.np.stack([gray8, sem.np.flipud(gray8), gray8], axis=2)
+        alpha = sem.np.dstack([color, sem.np.full_like(gray8, 255)])
+        cases = [('gray.tif', gray8), ('depth.TIFF', gray), ('gray.png', gray8),
+                 ('color.PNG', color), ('alpha.png', alpha), ('color.JPG', color),
+                 ('gray.JPEG', gray8)]
+        for name, data in cases:
+            with self.subTest(image=name):
+                image = folder / name
+                sem._imwrite_unicode_v19(image, data)
+                image.with_suffix('.TXT').write_text('PixelSize=0.8', encoding='utf-8')
+                decoded = sem._read_gray_image_unicode_v19(image)
+                self.assertEqual(decoded.shape, (32, 48))
+                self.assertEqual(decoded.dtype, sem.np.uint8)
+                self.assertGreater(int(decoded.max()), int(decoded.min()))
+                self.assertAlmostEqual(sem.read_pixel_size_nm(image).value_nm, 0.8)
+
     def test_pipeline_exports_all_pairs_beyond_nine(self):
         for condition, bcount, acount in [('10', 13, 13), ('11', 8, 9), ('12', 2, 2)]:
-            self.make_images(self.before, condition, bcount)
-            self.make_images(self.after, condition, acount, prefix='result')
+            suffixes = ('.tif', '.PNG', '.jpg', '.TIFF', '.jpeg')
+            before_names = [f'image_{i}{suffixes[(i - 1) % 5]}' for i in range(1, bcount + 1)]
+            after_names = [f'result_{i}{suffixes[i % 5]}' for i in range(1, acount + 1)]
+            self.make_images(self.before, condition, bcount, names=before_names)
+            self.make_images(self.after, condition, acount, names=after_names)
         output = self.root / 'output'
 
         def fake_measurement(image_path, stage, condition, ann_dir):
-            # Only the image detector is replaced; inventory, V27 wrapper,
+            # Only the image detector is replaced; inventory, V28 wrapper,
             # pairing, summaries, CSV and Excel generation all run normally.
             row = {
-                'stage': stage, 'stage_zh': sem.V27_STAGE_ZH[stage],
+                'stage': stage, 'stage_zh': sem.V28_STAGE_ZH[stage],
                 'condition': condition, 'condition_label': f'Condition {condition}',
                 'image': image_path.name,
                 'pattern': sem._classify_pattern_key_v19(image_path),
@@ -143,8 +206,8 @@ class InventoryTests(unittest.TestCase):
 
         with contextlib.redirect_stdout(io.StringIO()), \
                 patch.object(sem, '_process_one_image_v19', side_effect=fake_measurement) as process, \
-                patch.object(sem, '_v27_save_pair_plots'):
-            outputs = sem.main_v27(self.before, self.after, output, conditions=['10', '11', '12'], via_pattern_mode='via40')
+                patch.object(sem, '_v28_save_pair_plots'):
+            outputs = sem.main_v28(self.before, self.after, output, conditions=['10', '11', '12'], via_pattern_mode='via40')
         self.assertEqual(process.call_count, 30)
         inventory = sem.pd.read_csv(outputs['inventory'])
         statuses = sem.pd.read_csv(outputs['image_status'])
@@ -160,12 +223,15 @@ class InventoryTests(unittest.TestCase):
         self.assertTrue((objects['match_status'] == 'MATCHED').all())
         last_pair = pairs[pairs['pair_key'] == 'C10_R6_trench']
         self.assertEqual(len(last_pair), 2)
-        self.assertEqual(set(last_pair['before_image']), {'image_13.tif'})
-        self.assertEqual(set(last_pair['after_image']), {'result_13.tif'})
+        self.assertEqual(set(last_pair['before_image']), {'image_13.jpg'})
+        self.assertEqual(set(last_pair['after_image']), {'result_13.TIFF'})
         self.assertEqual(errors['error_type'].tolist(), ['IMAGE_COUNT_MISMATCH'])
         settings = json.loads(outputs['settings'].read_text(encoding='utf-8'))
-        self.assertIsNone(settings['required_tif_count_per_condition_stage'])
+        self.assertIsNone(settings['required_image_count_per_condition_stage'])
         self.assertEqual(settings['regions'], [2, 3, 4, 5, 6])
+        self.assertEqual(settings['supported_image_extensions'], ['.jpeg', '.jpg', '.png', '.tif', '.tiff'])
+        self.assertIn('V28', settings['script_version'])
+        self.assertEqual(outputs['excel'].name, 'SEM_0830_0831_before_after_V28_results.xlsx')
         from openpyxl import load_workbook
         workbook = load_workbook(outputs['excel'], read_only=True)
         self.addCleanup(workbook.close)

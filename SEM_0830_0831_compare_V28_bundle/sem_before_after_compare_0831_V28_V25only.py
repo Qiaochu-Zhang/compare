@@ -1,42 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SEM before/after comparison for 8 conditions, V25: V24 measurements plus zero-result automatic relaxed fallback.
+SEM before/after comparison V28, using the embedded V25 measurement algorithms.
 
-Expected input layout:
+Input: corresponding 10, 11, 12, 13, 14 subfolders under before/after roots.
+Supported images: .tif, .tiff, .png, .jpg, .jpeg (case-insensitive; may be mixed).
+Each condition may contain any number of images, with equal counts before/after.
+Images pair by natural filename order, even when filenames or formats differ.
+Patterns repeat trench, slot, via; regions start at 2 and increase every 3 images.
+Every image requires a same-stem TXT containing PixelSize=<number> in nm/pixel.
 
-before_root/
-  1/  40*.jpg + same-stem txt, 60*.jpg + txt, 160*.jpg + txt, 210*.jpg + txt
-  2/
-  ...
-  8/
-
-after_root/
-  1/ ...
-  ...
-  8/ ...
-
-Folder mapping:
-  before_root/1 and after_root/1 are Condition 1 before/after; likewise through Condition 8.
-
-Filename meanings:
-  40*  : round via / hole group A (reported separately)
-  60*  : round via / hole group B (reported separately)
-  160* : opposing trench bars; report Y-axis tip-to-tip gap and mean upper/lower rectangle width
-  210* : slot array; report mean X width and Y height of the bottom row only
-
-For 40*/60* vias, the X axis is fitted from the centers of the lowest complete
-row. The Y axis is perpendicular to that line and points upward in the image.
-For 160*/210*, Y is fitted from corresponding upper/lower structures and X is perpendicular.
-For trench, each column direction uses the midpoint of the outer short edge of the
-upper and lower edge-detected bars. For slot, only complete 4-object columns are
-accepted and each column direction is fitted through all four slot centers.
-
-Outputs include annotated images, object-level CSV, summary CSV/Excel, rejected
-object logs, and before/after grouped bar charts.
+Run with --before, --after and --output to select the input and output roots.
+Outputs include annotated images, object-level CSV, summary CSV/Excel,
+rejected object logs, and before/after comparison plots.
 
 Dependencies:
-  pip install opencv-python numpy pandas matplotlib openpyxl
+  pip install numpy pandas scipy opencv-python matplotlib openpyxl
 """
 
 from __future__ import annotations
@@ -549,7 +528,7 @@ def _decode_txt_variants(raw: bytes) -> List[Tuple[str, str]]:
 
 
 def _find_same_stem_txt(tif_path: Path) -> Tuple[Optional[Path], List[Path]]:
-    """Find exactly the TXT whose filename stem equals the TIF stem, case-insensitively."""
+    """Find exactly the TXT whose filename stem equals the image stem, case-insensitively."""
     folder = tif_path.parent
     expected = tif_path.with_suffix(".txt")
 
@@ -584,7 +563,7 @@ def read_pixel_size_nm(tif_path: Path) -> PixelSizeInfo:
 
     if PIXELSIZE_DEBUG:
         print(f"\n    [PixelSize DEBUG]")
-        print(f"      TIF absolute path     : {tif_path.resolve()}")
+        print(f"      Image absolute path   : {tif_path.resolve()}")
         print(f"      Expected TXT path    : {expected.resolve()}")
         print(f"      Expected TXT exists? : {expected.exists()}")
         print(f"      Folder exists?       : {tif_path.parent.exists()}")
@@ -607,7 +586,7 @@ def read_pixel_size_nm(tif_path: Path) -> PixelSizeInfo:
         raise PixelSizeTxtNotFound(
             f"Same-stem TXT FILE NOT FOUND for {tif_path.name}.\n"
             f"      Expected: {expected}\n"
-            f"      TIF folder: {tif_path.parent}\n"
+            f"      Image folder: {tif_path.parent}\n"
             f"      Found TXT files: {[p.name for p in txt_files]}"
             f"{extra}"
         )
@@ -11592,7 +11571,7 @@ def _process_one_image_v19(
 
 
 # ============================================================================
-# V27: 0830/0831 MATCHED-COUNT TIF BEFORE/AFTER PIPELINE -- V25 ONLY
+# V28: 0830/0831 MATCHED-COUNT MULTIFORMAT BEFORE/AFTER PIPELINE -- V25 ONLY
 # ============================================================================
 # This section intentionally reuses ONLY the V25 algorithms defined above.
 # No sem_cd_measure_200k_batch_V1_6.py code, import, or measurement rule is used.
@@ -11605,48 +11584,48 @@ def _process_one_image_v19(
 # Any image count is supported, including an incomplete final group, provided
 # the corresponding before/after condition folders contain the same count.
 #
-# Each TIF/TIFF must have a same-stem TXT containing:
+# Each supported image must have a same-stem TXT containing:
 #   PixelSize=<number>
 #
 # Before/after pairing is by condition + region + pattern, NOT by equal filename.
 
-import argparse as _argparse_v27
-import json as _json_v27
-import traceback as _traceback_v27
-from typing import Any as _Any_v27, Iterable as _Iterable_v27, Sequence as _Sequence_v27
+import argparse as _argparse_v28
+import json as _json_v28
+import traceback as _traceback_v28
+from typing import Any as _Any_v28, Iterable as _Iterable_v28, Sequence as _Sequence_v28
 
 try:
-    from scipy.optimize import linear_sum_assignment as _linear_sum_assignment_v27
-except ImportError as _exc_v27:
+    from scipy.optimize import linear_sum_assignment as _linear_sum_assignment_v28
+except ImportError as _exc_v28:
     raise SystemExit(
-        "V27 需要 scipy（逐对象 before/after 配对使用）。请运行：\n"
+        "V28 需要 scipy（逐对象 before/after 配对使用）。请运行：\n"
         "  pip install numpy pandas scipy opencv-python matplotlib openpyxl\n"
-        f"原始错误：{_exc_v27}"
-    ) from _exc_v27
+        f"原始错误：{_exc_v28}"
+    ) from _exc_v28
 
 
-V27_SCRIPT_VERSION = "2026-09-23-V27-0830-0831-MATCHED-COUNT-V25-ONLY"
-V27_DEFAULT_BEFORE_ROOT = Path(r"C:\Users\z00027644\Documents\倾斜刻蚀\SEM\830SEM_before_treat")
-V27_DEFAULT_AFTER_ROOT = Path(r"C:\Users\z00027644\Documents\倾斜刻蚀\SEM\0831SEM_10-14_topview_after")
-V27_DEFAULT_CONDITIONS = ("10", "11", "12", "13", "14")
-V27_FIRST_REGION = 2
-V27_PATTERN_SEQUENCE = ("trench", "slot", "via")
-V27_STAGES = ("before", "after")
-V27_STAGE_ZH = {"before": "处理前", "after": "处理后"}
-V27_PATTERN_ZH = {"trench": "Trench", "slot": "Slot最下排", "via": "Via"}
-V27_TIF_SUFFIXES = {".tif", ".tiff"}
+V28_SCRIPT_VERSION = "2026-09-23-V28-0830-0831-MATCHED-COUNT-MULTIFORMAT-V25-ONLY"
+V28_DEFAULT_BEFORE_ROOT = Path(r"C:\Users\z00027644\Documents\倾斜刻蚀\SEM\830SEM_before_treat")
+V28_DEFAULT_AFTER_ROOT = Path(r"C:\Users\z00027644\Documents\倾斜刻蚀\SEM\0831SEM_10-14_topview_after")
+V28_DEFAULT_CONDITIONS = ("10", "11", "12", "13", "14")
+V28_FIRST_REGION = 2
+V28_PATTERN_SEQUENCE = ("trench", "slot", "via")
+V28_STAGES = ("before", "after")
+V28_STAGE_ZH = {"before": "处理前", "after": "处理后"}
+V28_PATTERN_ZH = {"trench": "Trench", "slot": "Slot最下排", "via": "Via"}
+V28_IMAGE_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
 
 # V25 internal pattern keys. Trench/slot are fixed. Via is auto-selected from V25's
 # own via40/via60 models unless the user forces one with --via-pattern.
-V27_FIXED_PATTERN_KEY = {
+V28_FIXED_PATTERN_KEY = {
     "trench": "trench160",
     "slot": "slot210",
 }
-V27_VIA_KEYS = ("via40", "via60")
-V27_VIA_NOMINAL_NM = {"via40": 40.0, "via60": 60.0}
+V28_VIA_KEYS = ("via40", "via60")
+V28_VIA_NOMINAL_NM = {"via40": 40.0, "via60": 60.0}
 
 # Requested output metrics.
-V27_METRIC_SPECS = {
+V28_METRIC_SPECS = {
     "trench": [
         ("x_width_nm", "trench_width_nm", "Trench宽度"),
         ("tip_gap_y_nm", "tip_to_tip_y_nm", "Tip-to-tip Y距离"),
@@ -11663,14 +11642,14 @@ V27_METRIC_SPECS = {
 
 # Per-object normalized-position matching thresholds. This matching is ONLY for
 # comparison tables; it does not change any V25 detection or measurement result.
-V27_MATCH_THRESHOLD_VIA = 0.30
-V27_MATCH_THRESHOLD_1D = 0.28
+V28_MATCH_THRESHOLD_VIA = 0.30
+V28_MATCH_THRESHOLD_1D = 0.28
 
 
 # -----------------------------------------------------------------------------
-# V27 generic helpers
+# V28 generic helpers
 # -----------------------------------------------------------------------------
-def _v27_finite_float(value: _Any_v27, default: float = math.nan) -> float:
+def _v28_finite_float(value: _Any_v28, default: float = math.nan) -> float:
     try:
         x = float(value)
     except Exception:
@@ -11678,37 +11657,37 @@ def _v27_finite_float(value: _Any_v27, default: float = math.nan) -> float:
     return x if np.isfinite(x) else default
 
 
-def _v27_safe_mean(values: _Iterable_v27) -> float:
+def _v28_safe_mean(values: _Iterable_v28) -> float:
     a = pd.to_numeric(pd.Series(list(values), dtype="object"), errors="coerce").dropna().to_numpy(float)
     return float(np.mean(a)) if len(a) else math.nan
 
 
-def _v27_safe_median(values: _Iterable_v27) -> float:
+def _v28_safe_median(values: _Iterable_v28) -> float:
     a = pd.to_numeric(pd.Series(list(values), dtype="object"), errors="coerce").dropna().to_numpy(float)
     return float(np.median(a)) if len(a) else math.nan
 
 
-def _v27_natural_key(path: Path) -> tuple:
+def _v28_natural_key(path: Path) -> tuple:
     parts = re.split(r"(\d+)", path.stem.lower())
-    return tuple(int(p) if p.isdigit() else p for p in parts)
+    return (tuple(int(p) if p.isdigit() else p for p in parts), path.name.lower(), path.name)
 
 
-def _v27_df(rows) -> pd.DataFrame:
+def _v28_df(rows) -> pd.DataFrame:
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
-def _v27_write_csv(df: pd.DataFrame, path: Path) -> None:
+def _v28_write_csv(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, index=False, encoding="utf-8-sig")
 
 
-def _v27_expected_positions(image_count: int) -> List[dict]:
+def _v28_expected_positions(image_count: int) -> List[dict]:
     """Extend the original trench/slot/via order to every discovered image."""
     return [
         {
             "sequence_index": index + 1,
-            "region": V27_FIRST_REGION + index // len(V27_PATTERN_SEQUENCE),
-            "pattern": V27_PATTERN_SEQUENCE[index % len(V27_PATTERN_SEQUENCE)],
+            "region": V28_FIRST_REGION + index // len(V28_PATTERN_SEQUENCE),
+            "pattern": V28_PATTERN_SEQUENCE[index % len(V28_PATTERN_SEQUENCE)],
         }
         for index in range(image_count)
     ]
@@ -11717,7 +11696,7 @@ def _v27_expected_positions(image_count: int) -> List[dict]:
 # -----------------------------------------------------------------------------
 # Inventory / natural-order mapping with matching before/after counts
 # -----------------------------------------------------------------------------
-def _v27_discover_one_condition(stage: str, root: Path, condition: str):
+def _v28_discover_one_condition(stage: str, root: Path, condition: str):
     folder = Path(root) / str(condition)
     rows: List[dict] = []
     errors: List[dict] = []
@@ -11732,11 +11711,11 @@ def _v27_discover_one_condition(stage: str, root: Path, condition: str):
         return rows, errors
 
     images = sorted(
-        [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in V27_TIF_SUFFIXES],
-        key=_v27_natural_key,
+        [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in V28_IMAGE_SUFFIXES],
+        key=_v28_natural_key,
     )
 
-    for pos, image_path in zip(_v27_expected_positions(len(images)), images):
+    for pos, image_path in zip(_v28_expected_positions(len(images)), images):
         # Validate same-stem TXT + PixelSize now, but leave actual parsing to the exact V25
         # read_pixel_size_nm() again during measurement.
         txt_path = image_path.with_suffix(".txt")
@@ -11760,12 +11739,12 @@ def _v27_discover_one_condition(stage: str, root: Path, condition: str):
 
         rows.append({
             "stage": stage,
-            "stage_zh": V27_STAGE_ZH[stage],
+            "stage_zh": V28_STAGE_ZH[stage],
             "condition": str(condition),
             "condition_label": f"Condition {condition}",
             "region": int(pos["region"]),
             "pattern": str(pos["pattern"]),
-            "pattern_zh": V27_PATTERN_ZH[str(pos["pattern"])],
+            "pattern_zh": V28_PATTERN_ZH[str(pos["pattern"])],
             "sequence_index": int(pos["sequence_index"]),
             "image": image_path.name,
             "path": str(image_path),
@@ -11778,13 +11757,13 @@ def _v27_discover_one_condition(stage: str, root: Path, condition: str):
     return rows, errors
 
 
-def _v27_build_inventory(before_root: Path, after_root: Path, conditions: _Sequence_v27[str]):
+def _v28_build_inventory(before_root: Path, after_root: Path, conditions: _Sequence_v28[str]):
     rows: List[dict] = []
     errors: List[dict] = []
     for condition in conditions:
         condition = str(condition)
-        before_rows, before_errors = _v27_discover_one_condition("before", before_root, condition)
-        after_rows, after_errors = _v27_discover_one_condition("after", after_root, condition)
+        before_rows, before_errors = _v28_discover_one_condition("before", before_root, condition)
+        after_rows, after_errors = _v28_discover_one_condition("after", after_root, condition)
         condition_errors = before_errors + after_errors
         errors.extend(condition_errors)
         if any(e["error_type"] == "MISSING_CONDITION_FOLDER" for e in condition_errors):
@@ -11799,7 +11778,7 @@ def _v27_build_inventory(before_root: Path, after_root: Path, conditions: _Seque
                 "before_folder": str(Path(before_root) / condition),
                 "after_folder": str(Path(after_root) / condition),
                 "message": (
-                    f"Condition {condition} 的 TIF/TIFF 数量不一致："
+                    f"Condition {condition} 的图片数量不一致："
                     f"before={len(before_rows)}，after={len(after_rows)}。"
                     "跳过该 condition 的前后两组照片，避免错位配对。"
                 ),
@@ -11817,7 +11796,7 @@ def _v27_build_inventory(before_root: Path, after_root: Path, conditions: _Seque
 # -----------------------------------------------------------------------------
 # Exact V25 processing with an externally assigned pattern key
 # -----------------------------------------------------------------------------
-def _v27_process_v25_assigned(
+def _v28_process_v25_assigned(
     image_path: Path,
     stage: str,
     condition: str,
@@ -11862,19 +11841,19 @@ def _v27_process_v25_assigned(
         r = dict(r0)
         r["source_pattern_key"] = r.get("pattern", v25_pattern_key)
         r["pattern"] = public_pattern
-        r["pattern_zh"] = V27_PATTERN_ZH[public_pattern]
+        r["pattern_zh"] = V28_PATTERN_ZH[public_pattern]
         r["region"] = int(region)
         r["pair_key"] = pair_key
         r["source_algorithm"] = "V25_auto_fallback_only"
-        r["x_width_nm"] = _v27_finite_float(r.get("x_width_nm"))
-        r["y_height_nm"] = _v27_finite_float(r.get("y_height_nm"))
-        r["tip_gap_y_nm"] = _v27_finite_float(r.get("tip_gap_y_nm"))
+        r["x_width_nm"] = _v28_finite_float(r.get("x_width_nm"))
+        r["y_height_nm"] = _v28_finite_float(r.get("y_height_nm"))
+        r["tip_gap_y_nm"] = _v28_finite_float(r.get("tip_gap_y_nm"))
         normalized_rows.append(r)
 
     status = dict(status)
     status["source_pattern_key"] = status.get("pattern", v25_pattern_key)
     status["pattern"] = public_pattern
-    status["pattern_zh"] = V27_PATTERN_ZH[public_pattern]
+    status["pattern_zh"] = V28_PATTERN_ZH[public_pattern]
     status["region"] = int(region)
     status["pair_key"] = pair_key
     status["source_algorithm"] = "V25_auto_fallback_only"
@@ -11895,7 +11874,7 @@ def _v27_process_v25_assigned(
 # -----------------------------------------------------------------------------
 # Via40 / Via60 model choice using V25 ONLY
 # -----------------------------------------------------------------------------
-def _v27_via_trial_quality(rows: List[dict], status: dict, key: str) -> tuple:
+def _v28_via_trial_quality(rows: List[dict], status: dict, key: str) -> tuple:
     """Lexicographic quality used only to choose V25 via40 vs via60 on BEFORE.
 
     Measurement itself is untouched V25. Higher is better.
@@ -11905,18 +11884,18 @@ def _v27_via_trial_quality(rows: List[dict], status: dict, key: str) -> tuple:
 
     df = pd.DataFrame(rows)
     n = int(len(df))
-    fallback_level = int(_v27_finite_float(status.get("auto_fallback_level_used", 0), 0.0))
+    fallback_level = int(_v28_finite_float(status.get("auto_fallback_level_used", 0), 0.0))
     strict = 1 if fallback_level == 0 else 0
-    occupancy = _v27_finite_float(status.get("measure_array_occupancy_seed"), -1.0)
-    good_ray = _v27_safe_mean(df.get("via_good_ray_fraction", pd.Series(dtype=float)).tolist())
-    scale_score = _v27_safe_mean(df.get("via_scale_match_score", pd.Series(dtype=float)).tolist())
-    leak = _v27_safe_mean(df.get("via_outer_dark_leak_fraction", pd.Series(dtype=float)).tolist())
+    occupancy = _v28_finite_float(status.get("measure_array_occupancy_seed"), -1.0)
+    good_ray = _v28_safe_mean(df.get("via_good_ray_fraction", pd.Series(dtype=float)).tolist())
+    scale_score = _v28_safe_mean(df.get("via_scale_match_score", pd.Series(dtype=float)).tolist())
+    leak = _v28_safe_mean(df.get("via_outer_dark_leak_fraction", pd.Series(dtype=float)).tolist())
 
     x = pd.to_numeric(df.get("x_width_nm", pd.Series(dtype=float)), errors="coerce")
     y = pd.to_numeric(df.get("y_height_nm", pd.Series(dtype=float)), errors="coerce")
     d = (0.5 * (x + y)).dropna().to_numpy(float)
     med = float(np.median(d)) if len(d) else math.nan
-    nominal = V27_VIA_NOMINAL_NM[key]
+    nominal = V28_VIA_NOMINAL_NM[key]
     nominal_rel_error = abs(med - nominal) / nominal if np.isfinite(med) else 99.0
 
     # First ensure a repeated valid array, then favor strict V25 detection, lattice
@@ -11932,14 +11911,14 @@ def _v27_via_trial_quality(rows: List[dict], status: dict, key: str) -> tuple:
     )
 
 
-def _v27_choose_via_key_from_before(
+def _v28_choose_via_key_from_before(
     before_path: Path,
     condition: str,
     region: int,
     trial_root: Path,
     forced: str,
 ):
-    if forced in V27_VIA_KEYS:
+    if forced in V28_VIA_KEYS:
         return forced, [{
             "condition": str(condition),
             "region": int(region),
@@ -11954,18 +11933,18 @@ def _v27_choose_via_key_from_before(
     trial_rows: List[dict] = []
     best_key = "via40"
     best_quality = (-1, -1, -1e9, -1e9, -1e9, -1e9, -1e9)
-    for key in V27_VIA_KEYS:
+    for key in V28_VIA_KEYS:
         ann_dir = trial_root / str(condition) / f"Region_{region}" / key
         try:
-            rows, status, _ = _v27_process_v25_assigned(
+            rows, status, _ = _v28_process_v25_assigned(
                 before_path, "before", str(condition), int(region), "via", key, ann_dir
             )
-            quality = _v27_via_trial_quality(rows, status, key)
+            quality = _v28_via_trial_quality(rows, status, key)
             err = ""
             n = len(rows)
-            fallback = int(_v27_finite_float(status.get("auto_fallback_level_used", 0), 0.0))
-            medx = _v27_safe_median(pd.DataFrame(rows).get("x_width_nm", pd.Series(dtype=float)).tolist()) if rows else math.nan
-            medy = _v27_safe_median(pd.DataFrame(rows).get("y_height_nm", pd.Series(dtype=float)).tolist()) if rows else math.nan
+            fallback = int(_v28_finite_float(status.get("auto_fallback_level_used", 0), 0.0))
+            medx = _v28_safe_median(pd.DataFrame(rows).get("x_width_nm", pd.Series(dtype=float)).tolist()) if rows else math.nan
+            medy = _v28_safe_median(pd.DataFrame(rows).get("y_height_nm", pd.Series(dtype=float)).tolist()) if rows else math.nan
         except Exception as exc:
             quality = (-1, -1, -1e9, -1e9, -1e9, -1e9, -1e9)
             err = f"{type(exc).__name__}: {exc}"
@@ -11979,7 +11958,7 @@ def _v27_choose_via_key_from_before(
             "region": int(region),
             "before_image": before_path.name,
             "trial_pattern_key": key,
-            "trial_nominal_nm": V27_VIA_NOMINAL_NM[key],
+            "trial_nominal_nm": V28_VIA_NOMINAL_NM[key],
             "mode": "AUTO_V25_ONLY",
             "selected": False,
             "n_measurements": n,
@@ -12001,7 +11980,7 @@ def _v27_choose_via_key_from_before(
 # -----------------------------------------------------------------------------
 # Image-level statistics and before/after comparison
 # -----------------------------------------------------------------------------
-def _v27_build_image_metrics(objects_df: pd.DataFrame) -> pd.DataFrame:
+def _v28_build_image_metrics(objects_df: pd.DataFrame) -> pd.DataFrame:
     if objects_df.empty:
         return pd.DataFrame()
     records: List[dict] = []
@@ -12012,7 +11991,7 @@ def _v27_build_image_metrics(objects_df: pd.DataFrame) -> pd.DataFrame:
     for keys, g in objects_df.groupby(group_cols, dropna=False, sort=True):
         base = dict(zip(group_cols, keys if isinstance(keys, tuple) else (keys,)))
         pattern = str(base["pattern"])
-        for source_col, metric, metric_zh in V27_METRIC_SPECS[pattern]:
+        for source_col, metric, metric_zh in V28_METRIC_SPECS[pattern]:
             vals = pd.to_numeric(g.get(source_col, pd.Series(dtype=float)), errors="coerce").dropna().to_numpy(float)
             if not len(vals):
                 continue
@@ -12032,7 +12011,7 @@ def _v27_build_image_metrics(objects_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-def _v27_build_image_pair_comparison(image_metrics: pd.DataFrame) -> pd.DataFrame:
+def _v28_build_image_pair_comparison(image_metrics: pd.DataFrame) -> pd.DataFrame:
     if image_metrics.empty:
         return pd.DataFrame()
     idx = [
@@ -12040,7 +12019,7 @@ def _v27_build_image_pair_comparison(image_metrics: pd.DataFrame) -> pd.DataFram
         "pattern_zh", "metric", "metric_zh", "source_column",
     ]
     out = image_metrics[idx].drop_duplicates().copy()
-    for stage in V27_STAGES:
+    for stage in V28_STAGES:
         s = image_metrics[image_metrics["stage"] == stage].copy()
         keep = idx + ["image", "n", "mean_nm", "std_nm", "sem_nm", "median_nm", "min_nm", "max_nm"]
         s = s[keep].rename(columns={
@@ -12065,21 +12044,21 @@ def _v27_build_image_pair_comparison(image_metrics: pd.DataFrame) -> pd.DataFram
         np.nan,
     )
 
-    corder = {c: i for i, c in enumerate(V27_DEFAULT_CONDITIONS)}
-    porder = {p: i for i, p in enumerate(V27_PATTERN_SEQUENCE)}
+    corder = {c: i for i, c in enumerate(V28_DEFAULT_CONDITIONS)}
+    porder = {p: i for i, p in enumerate(V28_PATTERN_SEQUENCE)}
     out["_co"] = out["condition"].astype(str).map(corder).fillna(999)
     out["_po"] = out["pattern"].map(porder).fillna(999)
     out = out.sort_values(["_co", "region", "_po", "metric"]).drop(columns=["_co", "_po"]).reset_index(drop=True)
     return out
 
 
-def _v27_build_overall_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
+def _v28_build_overall_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
     """Pool all discovered regions per condition, separate from image-by-image comparison."""
     if objects_df.empty:
         return pd.DataFrame()
     long_rows: List[dict] = []
     for (stage, condition, pattern), g in objects_df.groupby(["stage", "condition", "pattern"], sort=True):
-        for source_col, metric, metric_zh in V27_METRIC_SPECS[str(pattern)]:
+        for source_col, metric, metric_zh in V28_METRIC_SPECS[str(pattern)]:
             vals = pd.to_numeric(g.get(source_col, pd.Series(dtype=float)), errors="coerce").dropna().to_numpy(float)
             if not len(vals):
                 continue
@@ -12088,7 +12067,7 @@ def _v27_build_overall_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
                 "condition": str(condition),
                 "condition_label": f"Condition {condition}",
                 "pattern": pattern,
-                "pattern_zh": V27_PATTERN_ZH[str(pattern)],
+                "pattern_zh": V28_PATTERN_ZH[str(pattern)],
                 "metric": metric,
                 "metric_zh": metric_zh,
                 "source_column": source_col,
@@ -12102,7 +12081,7 @@ def _v27_build_overall_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
         return long
     idx = ["condition", "condition_label", "pattern", "pattern_zh", "metric", "metric_zh", "source_column"]
     out = long[idx].drop_duplicates().copy()
-    for stage in V27_STAGES:
+    for stage in V28_STAGES:
         s = long[long["stage"] == stage][idx + ["n", "mean_nm", "std_nm", "median_nm"]].rename(columns={
             "n": f"{stage}_n",
             "mean_nm": f"{stage}_mean_nm",
@@ -12120,7 +12099,7 @@ def _v27_build_overall_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 # Per-object spatial before/after matching (comparison only)
 # -----------------------------------------------------------------------------
-def _v27_normalized_1d(g: pd.DataFrame) -> np.ndarray:
+def _v28_normalized_1d(g: pd.DataFrame) -> np.ndarray:
     if "center_axis_x_px" in g:
         s = g["center_axis_x_px"]
     elif "center_image_x_px" in g:
@@ -12135,7 +12114,7 @@ def _v27_normalized_1d(g: pd.DataFrame) -> np.ndarray:
     return (x - np.nanmin(x)) / max(np.nanmax(x) - np.nanmin(x), 1e-9)
 
 
-def _v27_normalized_2d(g: pd.DataFrame) -> np.ndarray:
+def _v28_normalized_2d(g: pd.DataFrame) -> np.ndarray:
     out = np.zeros((len(g), 2), float)
     for j, name in enumerate(("center_image_x_px", "center_image_y_px")):
         if name not in g:
@@ -12149,7 +12128,7 @@ def _v27_normalized_2d(g: pd.DataFrame) -> np.ndarray:
     return out
 
 
-def _v27_match_objects(before: pd.DataFrame, after: pd.DataFrame, pattern: str):
+def _v28_match_objects(before: pd.DataFrame, after: pd.DataFrame, pattern: str):
     b = before.copy().reset_index(drop=True)
     a = after.copy().reset_index(drop=True)
     if b.empty:
@@ -12158,15 +12137,15 @@ def _v27_match_objects(before: pd.DataFrame, after: pd.DataFrame, pattern: str):
         return [(b.iloc[i], None, math.nan) for i in range(len(b))]
 
     if pattern == "via":
-        pb, pa = _v27_normalized_2d(b), _v27_normalized_2d(a)
-        threshold = V27_MATCH_THRESHOLD_VIA
+        pb, pa = _v28_normalized_2d(b), _v28_normalized_2d(a)
+        threshold = V28_MATCH_THRESHOLD_VIA
     else:
-        pb = _v27_normalized_1d(b)[:, None]
-        pa = _v27_normalized_1d(a)[:, None]
-        threshold = V27_MATCH_THRESHOLD_1D
+        pb = _v28_normalized_1d(b)[:, None]
+        pa = _v28_normalized_1d(a)[:, None]
+        threshold = V28_MATCH_THRESHOLD_1D
 
     cost = np.linalg.norm(pb[:, None, :] - pa[None, :, :], axis=2)
-    bi, aj = _linear_sum_assignment_v27(cost)
+    bi, aj = _linear_sum_assignment_v28(cost)
     accepted = {}
     used_a = set()
     dist = {}
@@ -12190,7 +12169,7 @@ def _v27_match_objects(before: pd.DataFrame, after: pd.DataFrame, pattern: str):
     return pairs
 
 
-def _v27_build_object_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
+def _v28_build_object_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
     if objects_df.empty:
         return pd.DataFrame()
     records: List[dict] = []
@@ -12208,7 +12187,7 @@ def _v27_build_object_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
         ]
         before = g[g["stage"] == "before"]
         after = g[g["stage"] == "after"]
-        pairs = _v27_match_objects(before, after, pattern)
+        pairs = _v28_match_objects(before, after, pattern)
         for pair_id, (b, a, match_distance) in enumerate(pairs, 1):
             base = {
                 "condition": condition,
@@ -12216,7 +12195,7 @@ def _v27_build_object_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
                 "region": region,
                 "pair_key": pair_key,
                 "pattern": pattern,
-                "pattern_zh": V27_PATTERN_ZH[pattern],
+                "pattern_zh": V28_PATTERN_ZH[pattern],
                 "matched_pair_id": pair_id,
                 "match_distance_normalized": match_distance,
                 "before_object_id": b.get("object_id") if b is not None else math.nan,
@@ -12225,9 +12204,9 @@ def _v27_build_object_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
                 "after_image": a.get("image") if a is not None else "",
                 "match_status": "MATCHED" if b is not None and a is not None else ("BEFORE_ONLY" if b is not None else "AFTER_ONLY"),
             }
-            for source_col, metric, metric_zh in V27_METRIC_SPECS[pattern]:
-                bv = _v27_finite_float(b.get(source_col)) if b is not None else math.nan
-                av = _v27_finite_float(a.get(source_col)) if a is not None else math.nan
+            for source_col, metric, metric_zh in V28_METRIC_SPECS[pattern]:
+                bv = _v28_finite_float(b.get(source_col)) if b is not None else math.nan
+                av = _v28_finite_float(a.get(source_col)) if a is not None else math.nan
                 delta = av - bv if np.isfinite(av) and np.isfinite(bv) else math.nan
                 rec = dict(base)
                 rec.update({
@@ -12245,11 +12224,11 @@ def _v27_build_object_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 # Plotting
 # -----------------------------------------------------------------------------
-def _v27_safe_plot_name(s: str) -> str:
+def _v28_safe_plot_name(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(s))
 
 
-def _v27_save_pair_plots(pair_df: pd.DataFrame, plot_dir: Path) -> None:
+def _v28_save_pair_plots(pair_df: pd.DataFrame, plot_dir: Path) -> None:
     if pair_df.empty:
         return
     plot_dir.mkdir(parents=True, exist_ok=True)
@@ -12273,7 +12252,7 @@ def _v27_save_pair_plots(pair_df: pd.DataFrame, plot_dir: Path) -> None:
         ax.legend()
         ax.grid(axis="y", alpha=0.25)
         fig.tight_layout()
-        out = plot_dir / f"C{condition}__{pattern}__{_v27_safe_plot_name(metric)}__before_after.png"
+        out = plot_dir / f"C{condition}__{pattern}__{_v28_safe_plot_name(metric)}__before_after.png"
         fig.savefig(out, dpi=220)
         plt.close(fig)
 
@@ -12292,25 +12271,25 @@ def _v27_save_pair_plots(pair_df: pd.DataFrame, plot_dir: Path) -> None:
         ax.set_title(f"{str(pattern).upper()} | {metric} | Before/After delta")
         ax.grid(axis="y", alpha=0.25)
         fig.tight_layout()
-        out = plot_dir / f"ALL__{pattern}__{_v27_safe_plot_name(metric)}__delta.png"
+        out = plot_dir / f"ALL__{pattern}__{_v28_safe_plot_name(metric)}__delta.png"
         fig.savefig(out, dpi=220)
         plt.close(fig)
 
 
 # -----------------------------------------------------------------------------
-# Main V27 pipeline
+# Main V28 pipeline
 # -----------------------------------------------------------------------------
-def main_v27(
+def main_v28(
     before_root: Path,
     after_root: Path,
     output_root: Optional[Path] = None,
-    conditions: _Sequence_v27[str] = V27_DEFAULT_CONDITIONS,
+    conditions: _Sequence_v28[str] = V28_DEFAULT_CONDITIONS,
     via_pattern_mode: str = "auto",
 ):
     before_root = Path(before_root)
     after_root = Path(after_root)
     if output_root is None:
-        output_root = after_root.parent / "SEM_0830_0831_compare_V27"
+        output_root = after_root.parent / "SEM_0830_0831_compare_V28"
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -12326,22 +12305,22 @@ def main_v27(
     plot_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 100)
-    print("V27 | matched-count TIF before/after comparison | V25 ONLY")
+    print("V28 | matched-count TIF/TIFF/PNG/JPG/JPEG before/after comparison | V25 ONLY")
     print(f"Before : {before_root}")
     print(f"After  : {after_root}")
     print(f"Output : {output_root}")
     print(f"Via mode: {via_pattern_mode}")
     print("=" * 100)
 
-    inventory_df, preflight_errors_df = _v27_build_inventory(before_root, after_root, conditions)
-    _v27_write_csv(inventory_df, output_root / "inventory_mapping.csv")
-    _v27_write_csv(preflight_errors_df, output_root / "processing_errors.csv")
+    inventory_df, preflight_errors_df = _v28_build_inventory(before_root, after_root, conditions)
+    _v28_write_csv(inventory_df, output_root / "inventory_mapping.csv")
+    _v28_write_csv(preflight_errors_df, output_root / "processing_errors.csv")
     if not preflight_errors_df.empty:
         for error in preflight_errors_df.to_dict("records"):
             print(f"  PREFLIGHT [{error['error_type']}]: {error['message']}")
     if inventory_df.empty:
         raise RuntimeError(
-            "没有建立任何有效 inventory。请检查对应子文件夹是否存在、是否包含 TIF/TIFF，"
+            "没有建立任何有效 inventory。请检查对应子文件夹是否存在、是否包含 TIF/TIFF/PNG/JPG/JPEG 图片，"
             "以及 before/after 照片数量是否一致；详情见 processing_errors.csv。"
         )
 
@@ -12354,9 +12333,9 @@ def main_v27(
     # Process pair-by-pair so the same auto-selected via40/via60 model is used for
     # BEFORE and AFTER of the corresponding condition + region.
     pair_keys = inventory_df[["condition", "region", "pattern", "pair_key"]].drop_duplicates().copy()
-    _pattern_order_v27 = {p: i for i, p in enumerate(V27_PATTERN_SEQUENCE)}
-    pair_keys["_pattern_order_v27"] = pair_keys["pattern"].map(_pattern_order_v27).fillna(999)
-    pair_keys = pair_keys.sort_values(["condition", "region", "_pattern_order_v27"]).drop(columns=["_pattern_order_v27"]).reset_index(drop=True)
+    _pattern_order_v28 = {p: i for i, p in enumerate(V28_PATTERN_SEQUENCE)}
+    pair_keys["_pattern_order_v28"] = pair_keys["pattern"].map(_pattern_order_v28).fillna(999)
+    pair_keys = pair_keys.sort_values(["condition", "region", "_pattern_order_v28"]).drop(columns=["_pattern_order_v28"]).reset_index(drop=True)
 
     for _, pk in pair_keys.iterrows():
         condition = str(pk["condition"])
@@ -12365,10 +12344,10 @@ def main_v27(
         pair_key = str(pk["pair_key"])
         pair_inv = inventory_df[inventory_df["pair_key"] == pair_key]
 
-        print(f"\n[{pair_key}] {V27_PATTERN_ZH[pattern]}")
+        print(f"\n[{pair_key}] {V28_PATTERN_ZH[pattern]}")
         stage_paths = {}
         valid = True
-        for stage in V27_STAGES:
+        for stage in V28_STAGES:
             q = pair_inv[pair_inv["stage"] == stage]
             if q.empty:
                 valid = False
@@ -12403,13 +12382,13 @@ def main_v27(
             continue
 
         # Fixed keys for trench/slot.
-        if pattern in V27_FIXED_PATTERN_KEY:
-            selected_key = V27_FIXED_PATTERN_KEY[pattern]
+        if pattern in V28_FIXED_PATTERN_KEY:
+            selected_key = V28_FIXED_PATTERN_KEY[pattern]
         else:
             # Via key is chosen from BEFORE only, then frozen for AFTER.
             before_path = stage_paths["before"]
             try:
-                selected_key, trials = _v27_choose_via_key_from_before(
+                selected_key, trials = _v28_choose_via_key_from_before(
                     before_path, condition, region, trial_root, via_pattern_mode
                 )
                 for t in trials:
@@ -12428,18 +12407,18 @@ def main_v27(
                     "path": str(before_path),
                     "error_type": type(exc).__name__,
                     "message": f"V25 via40/via60 selection failed: {exc}",
-                    "traceback": _traceback_v27.format_exc(),
+                    "traceback": _traceback_v28.format_exc(),
                 })
                 print(f"  VIA MODEL ERROR: {type(exc).__name__}: {exc}")
                 continue
 
-        for stage in V27_STAGES:
+        for stage in V28_STAGES:
             image_path = stage_paths[stage]
             ann_dir = ann_root / stage / condition / f"Region_{region}"
             seq_index = int(pair_inv[pair_inv["stage"] == stage].iloc[0]["sequence_index"])
-            print(f"  {V27_STAGE_ZH[stage]} {image_path.name} -> {selected_key}")
+            print(f"  {V28_STAGE_ZH[stage]} {image_path.name} -> {selected_key}")
             try:
-                rows, status, rejects = _v27_process_v25_assigned(
+                rows, status, rejects = _v28_process_v25_assigned(
                     image_path=image_path,
                     stage=stage,
                     condition=condition,
@@ -12469,17 +12448,17 @@ def main_v27(
                     "selected_v25_pattern_key": selected_key,
                     "error_type": type(exc).__name__,
                     "message": str(exc),
-                    "traceback": _traceback_v27.format_exc(),
+                    "traceback": _traceback_v28.format_exc(),
                 })
                 status_rows.append({
                     "stage": stage,
-                    "stage_zh": V27_STAGE_ZH[stage],
+                    "stage_zh": V28_STAGE_ZH[stage],
                     "condition": condition,
                     "condition_label": f"Condition {condition}",
                     "region": region,
                     "pair_key": pair_key,
                     "pattern": pattern,
-                    "pattern_zh": V27_PATTERN_ZH[pattern],
+                    "pattern_zh": V28_PATTERN_ZH[pattern],
                     "image": image_path.name,
                     "path": str(image_path),
                     "selected_v25_pattern_key": selected_key,
@@ -12489,23 +12468,23 @@ def main_v27(
                 })
                 print(f"    ERROR {type(exc).__name__}: {exc}")
 
-    objects_df = _v27_df(all_rows)
-    status_df = _v27_df(status_rows)
-    rejected_df = _v27_df(rejected_rows)
-    errors_df = _v27_df(processing_errors)
-    via_choice_df = _v27_df(via_choice_rows)
+    objects_df = _v28_df(all_rows)
+    status_df = _v28_df(status_rows)
+    rejected_df = _v28_df(rejected_rows)
+    errors_df = _v28_df(processing_errors)
+    via_choice_df = _v28_df(via_choice_rows)
 
     if not objects_df.empty:
         sort_cols = [c for c in ["condition", "region", "pattern", "stage", "image", "object_id"] if c in objects_df.columns]
         objects_df = objects_df.sort_values(sort_cols).reset_index(drop=True)
 
-    image_metrics_df = _v27_build_image_metrics(objects_df)
-    image_pair_df = _v27_build_image_pair_comparison(image_metrics_df)
-    overall_df = _v27_build_overall_comparison(objects_df)
-    object_pair_df = _v27_build_object_comparison(objects_df)
+    image_metrics_df = _v28_build_image_metrics(objects_df)
+    image_pair_df = _v28_build_image_pair_comparison(image_metrics_df)
+    overall_df = _v28_build_overall_comparison(objects_df)
+    object_pair_df = _v28_build_object_comparison(objects_df)
 
     outputs = {
-        "excel": output_root / "SEM_0830_0831_before_after_V27_results.xlsx",
+        "excel": output_root / "SEM_0830_0831_before_after_V28_results.xlsx",
         "inventory": output_root / "inventory_mapping.csv",
         "image_status": output_root / "image_status.csv",
         "all_objects": output_root / "all_object_measurements.csv",
@@ -12519,19 +12498,19 @@ def main_v27(
         "settings": output_root / "settings.json",
     }
 
-    _v27_write_csv(inventory_df, outputs["inventory"])
-    _v27_write_csv(status_df, outputs["image_status"])
-    _v27_write_csv(objects_df, outputs["all_objects"])
-    _v27_write_csv(image_metrics_df, outputs["image_metrics"])
-    _v27_write_csv(image_pair_df, outputs["image_pair_comparison"])
-    _v27_write_csv(overall_df, outputs["overall_comparison"])
-    _v27_write_csv(object_pair_df, outputs["object_comparison"])
-    _v27_write_csv(rejected_df, outputs["rejected_objects"])
-    _v27_write_csv(via_choice_df, outputs["via_model_choice"])
-    _v27_write_csv(errors_df, outputs["errors"])
+    _v28_write_csv(inventory_df, outputs["inventory"])
+    _v28_write_csv(status_df, outputs["image_status"])
+    _v28_write_csv(objects_df, outputs["all_objects"])
+    _v28_write_csv(image_metrics_df, outputs["image_metrics"])
+    _v28_write_csv(image_pair_df, outputs["image_pair_comparison"])
+    _v28_write_csv(overall_df, outputs["overall_comparison"])
+    _v28_write_csv(object_pair_df, outputs["object_comparison"])
+    _v28_write_csv(rejected_df, outputs["rejected_objects"])
+    _v28_write_csv(via_choice_df, outputs["via_model_choice"])
+    _v28_write_csv(errors_df, outputs["errors"])
 
     settings = {
-        "script_version": V27_SCRIPT_VERSION,
+        "script_version": V28_SCRIPT_VERSION,
         "algorithm_base": "sem_before_after_compare_V25_auto_fallback.py only",
         "v1_6_used": False,
         "before_root": str(before_root),
@@ -12539,23 +12518,24 @@ def main_v27(
         "output_root": str(output_root),
         "conditions": list(conditions),
         "regions": sorted(int(r) for r in inventory_df["region"].unique()),
-        "pattern_sequence_per_region": list(V27_PATTERN_SEQUENCE),
-        "required_tif_count_per_condition_stage": None,
-        "image_count_rule": "equal TIF/TIFF counts in corresponding before/after condition folders; no fixed count",
+        "pattern_sequence_per_region": list(V28_PATTERN_SEQUENCE),
+        "supported_image_extensions": sorted(V28_IMAGE_SUFFIXES),
+        "required_image_count_per_condition_stage": None,
+        "image_count_rule": "equal supported-image counts in corresponding before/after condition folders; formats may differ; no fixed count",
         "pairing_rule": "condition + natural filename order; region/pattern extend in groups of three from Region 2; filenames need not match",
         "pixel_size_rule": "same-stem TXT, PixelSize=<number>, parsed by V25 read_pixel_size_nm",
         "trench_v25_key": "trench160",
         "slot_v25_key": "slot210",
         "via_pattern_mode": via_pattern_mode,
         "via_auto_rule": "test V25 via40 and via60 on BEFORE only; select by V25 result quality; freeze same key for AFTER",
-        "metric_specs": V27_METRIC_SPECS,
+        "metric_specs": V28_METRIC_SPECS,
         "accepted_object_count": int(len(objects_df)),
         "image_metric_rows": int(len(image_metrics_df)),
         "image_pair_rows": int(len(image_pair_df)),
         "object_pair_rows": int(len(object_pair_df)),
         "error_or_warning_rows": int(len(errors_df)),
     }
-    outputs["settings"].write_text(_json_v27.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    outputs["settings"].write_text(_json_v28.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
 
     with pd.ExcelWriter(outputs["excel"], engine="openpyxl") as writer:
         inventory_df.to_excel(writer, sheet_name="inventory", index=False)
@@ -12571,10 +12551,10 @@ def main_v27(
         pd.DataFrame([settings]).to_excel(writer, sheet_name="settings", index=False)
         _autofit_excel_v19(writer)
 
-    _v27_save_pair_plots(image_pair_df, plot_dir)
+    _v28_save_pair_plots(image_pair_df, plot_dir)
 
     print("\n" + "=" * 100)
-    print("V27 处理完成")
+    print("V28 处理完成")
     print(f"Accepted objects        : {len(objects_df)}")
     print(f"Image metric rows       : {len(image_metrics_df)}")
     print(f"Image pair compare rows : {len(image_pair_df)}")
@@ -12588,26 +12568,26 @@ def main_v27(
 
 
 # -----------------------------------------------------------------------------
-# V27 CLI
+# V28 CLI
 # -----------------------------------------------------------------------------
-def _v27_build_parser():
-    parser = _argparse_v27.ArgumentParser(
+def _v28_build_parser():
+    parser = _argparse_v28.ArgumentParser(
         description=(
-            "V27: 0830 before / 0831 after SEM comparison with matching TIF counts per condition. "
+            "V28: 0830 before / 0831 after SEM comparison with matching image counts per condition (TIF/TIFF/PNG/JPG/JPEG). "
             "Trench, slot and via all use V25 rules only."
         )
     )
     parser.add_argument(
-        "--before", type=Path, default=V27_DEFAULT_BEFORE_ROOT,
-        help=f"处理前根目录；默认：{V27_DEFAULT_BEFORE_ROOT}",
+        "--before", type=Path, default=V28_DEFAULT_BEFORE_ROOT,
+        help=f"处理前根目录；默认：{V28_DEFAULT_BEFORE_ROOT}",
     )
     parser.add_argument(
-        "--after", type=Path, default=V27_DEFAULT_AFTER_ROOT,
-        help=f"处理后根目录；默认：{V27_DEFAULT_AFTER_ROOT}",
+        "--after", type=Path, default=V28_DEFAULT_AFTER_ROOT,
+        help=f"处理后根目录；默认：{V28_DEFAULT_AFTER_ROOT}",
     )
     parser.add_argument(
         "--output", type=Path, default=None,
-        help="输出目录；默认在两个输入目录同级建立 SEM_0830_0831_compare_V27",
+        help="输出目录；默认在两个输入目录同级建立 SEM_0830_0831_compare_V28",
     )
     parser.add_argument(
         "--via-pattern", choices=("auto", "via40", "via60"), default="auto",
@@ -12619,17 +12599,17 @@ def _v27_build_parser():
     return parser
 
 
-def _v27_cli(argv=None) -> int:
-    args = _v27_build_parser().parse_args(argv)
+def _v28_cli(argv=None) -> int:
+    args = _v28_build_parser().parse_args(argv)
     try:
         before_root = Path(args.before)
         after_root = Path(args.after)
-        output_root = Path(args.output) if args.output is not None else after_root.parent / "SEM_0830_0831_compare_V27"
-        main_v27(
+        output_root = Path(args.output) if args.output is not None else after_root.parent / "SEM_0830_0831_compare_V28"
+        main_v28(
             before_root=before_root,
             after_root=after_root,
             output_root=output_root,
-            conditions=V27_DEFAULT_CONDITIONS,
+            conditions=V28_DEFAULT_CONDITIONS,
             via_pattern_mode=str(args.via_pattern),
         )
         return 0
@@ -12637,10 +12617,10 @@ def _v27_cli(argv=None) -> int:
         print("用户中断。", file=sys.stderr)
         return 130
     except Exception as exc:
-        print(f"V27 程序失败：{type(exc).__name__}: {exc}", file=sys.stderr)
-        _traceback_v27.print_exc()
+        print(f"V28 程序失败：{type(exc).__name__}: {exc}", file=sys.stderr)
+        _traceback_v28.print_exc()
         return 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(_v27_cli())
+    raise SystemExit(_v28_cli())
