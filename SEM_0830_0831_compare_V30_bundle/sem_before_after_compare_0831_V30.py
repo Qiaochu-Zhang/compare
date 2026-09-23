@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SEM before/after comparison V29, using the embedded V25 measurement algorithms.
+SEM before/after comparison V30: improved slot recovery and a 300s per-image limit.
 
 Input: numeric-named immediate subfolders discovered under the after root.
 Process them in numeric order and match exact folder names under the before root.
@@ -4139,7 +4139,7 @@ def _fit_four_row_centers_v17(
         return None
     hypotheses = sorted(set(round(p, 3) for p in hypotheses))
 
-    # V29: keep every original hypothesis and the original score/tie ordering.
+    # V30: keep every original hypothesis and the original score/tie ordering.
     # Count support in four Y intervals by binary search first. Since the residual
     # penalty is nonnegative, 5*occupied_rows + support is an upper bound: models
     # below the best score cannot win and need no per-candidate distance matrix.
@@ -6318,7 +6318,137 @@ def _v18_slot_masks_at_roi(roi: np.ndarray, aggressive_level: int) -> Dict[str,n
     return masks
 
 
+_V30_SLOT_RECOVERY_DIAGNOSTICS = Counter()
+
+
+def _v30_slot_flatfield_response(roi: np.ndarray) -> Tuple[np.ndarray, float]:
+    """Estimate background from the ROI rim, excluding foreground outliers.
+
+    Subtracting a fitted plane preserves feature contrast under a brightness
+    gradient; stretching the raw ROI alone cannot remove that gradient.
+    """
+    smooth = cv2.GaussianBlur(roi.astype(np.float32), (0, 0), 0.9)
+    yy, xx = np.mgrid[-1:1:complex(roi.shape[0]), -1:1:complex(roi.shape[1])]
+    rim = (np.abs(xx) >= 0.70) | (np.abs(yy) >= 0.85)
+    design = np.column_stack([np.ones(np.count_nonzero(rim)), xx[rim], yy[rim]])
+    values = smooth[rim].astype(float)
+    stride = max(1, len(values) // 6000)
+    design, values = design[::stride], values[::stride]
+    keep = np.ones(len(values), dtype=bool)
+    sign = 1.0 if FEATURE_POLARITY.lower() == 'dark' else -1.0
+    for _ in range(3):
+        if np.count_nonzero(keep) < 8:
+            break
+        coef, *_ = np.linalg.lstsq(design[keep], values[keep], rcond=None)
+        residual = sign * (values - design @ coef)
+        median = float(np.median(residual))
+        spread = max(0.5, 1.4826 * float(np.median(np.abs(residual - median))))
+        keep = (residual >= median - 2.5 * spread) & (residual <= median + 3.5 * spread)
+    background = coef[0] + coef[1] * xx + coef[2] * yy
+    noise_residual = roi.astype(float) - smooth
+    noise = 1.4826 * float(np.median(np.abs(noise_residual - np.median(noise_residual))))
+    return np.maximum(sign * (background - smooth), 0).astype(np.float32), noise
+
+
+def _v30_slot_flatfield_candidates(gray: np.ndarray, pool: List[ShapeDesc]) -> List[ShapeDesc]:
+    """Find real contours before lattice fitting, even with uneven illumination."""
+    h, w = gray.shape
+    smooth = cv2.GaussianBlur(gray, (0, 0), 0.9)
+    residual = gray.astype(float) - smooth.astype(float)
+    noise = 1.4826 * float(np.median(np.abs(residual - np.median(residual))))
+    widths = [cv2.boundingRect(d.contour)[2] for d in pool
+              if _slot_shape_ok_v17(d, (SLOT_MIN_AREA_PX, np.inf), seed=True)]
+    width = float(np.median(widths)) if widths else max(5.0, w / 32.0)
+    kernels = sorted(set(max(5, min(129, int(round(width * factor)) | 1)) for factor in (2., 3., 4.)))
+    result = []
+    for size in kernels:
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (size, 1))
+        operation = cv2.MORPH_BLACKHAT if FEATURE_POLARITY.lower() == 'dark' else cv2.MORPH_TOPHAT
+        response = cv2.morphologyEx(smooth, operation, kernel).astype(np.float32)
+        peak = float(np.percentile(response, 99.5))
+        if peak < max(2.0, 3.0 * noise):
+            continue
+        for fraction in (0.50, 0.35):
+            threshold = max(1.5, 2.5 * noise, fraction * peak)
+            mask = (response >= threshold).astype(np.uint8) * 255
+            mask = _postprocess_binary_v12(mask, 1)
+            candidates = extract_loose_descriptors_v12(mask, 'slot_v30_flatfield', 'slot', 160)
+            for d in candidates:
+                if not _slot_shape_ok_v17(d, (SLOT_MIN_AREA_PX, 0.035 * h * w), seed=True):
+                    continue
+                if not _desc_close_to_any_selected_v12(d, result):
+                    result.append(d)
+                    if len(result) >= 160:
+                        return result
+    return result
+
+
+def _v30_recover_flatfield_slot(
+    gray, expected_xy, x_pitch, row_pitch, expected_w, expected_h, area_limits,
+) -> Optional[ShapeDesc]:
+    h, w = gray.shape
+    cx, cy = map(float, expected_xy)
+    # Use the site cell, not a narrow ROI derived from a possibly fragmented seed.
+    hw = max(14., 0.48 * x_pitch)
+    hh = max(16., 0.72 * row_pitch)
+    x0, x1 = max(0, int(cx - hw)), min(w, int(math.ceil(cx + hw + 1)))
+    y0, y1 = max(0, int(cy - hh)), min(h, int(math.ceil(cy + hh + 1)))
+    roi = gray[y0:y1, x0:x1]
+    if min(roi.shape, default=0) < 9:
+        _V30_SLOT_RECOVERY_DIAGNOSTICS['roi_too_small'] += 1
+        return None
+    response, noise = _v30_slot_flatfield_response(roi)
+    peak = float(np.percentile(response, 99.0))
+    if peak < max(2.0, 3.0 * noise):
+        _V30_SLOT_RECOVERY_DIAGNOSTICS['weak_local_contrast'] += 1
+        return None
+    xt = max(6., V17_SLOT_RECOVER_CENTER_X_FRAC * x_pitch)
+    yt = max(6., V17_SLOT_RECOVER_CENTER_Y_FRAC * row_pitch)
+    best = None
+    for fraction in (0.50, 0.35, 0.65):
+        mask = (response >= max(1.0, 2.0 * noise, fraction * peak)).astype(np.uint8) * 255
+        mask = _postprocess_binary_v12(mask, 1)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            _V30_SLOT_RECOVERY_DIAGNOSTICS['no_contour'] += 1
+        for contour in contours:
+            if contour_pixel_count(contour) < SLOT_MIN_AREA_PX:
+                continue
+            bx, by, bw, bh = cv2.boundingRect(contour)
+            if bx <= 1 or by <= 1 or bx + bw >= roi.shape[1] - 1 or by + bh >= roi.shape[0] - 1:
+                _V30_SLOT_RECOVERY_DIAGNOSTICS['touches_roi_border'] += 1
+                continue
+            contour = contour.copy(); contour[:, 0, 0] += x0; contour[:, 0, 1] += y0
+            d = describe_contour(contour)
+            if d is None:
+                continue
+            if abs(float(d.center[0]) - cx) > xt or abs(float(d.center[1]) - cy) > yt:
+                _V30_SLOT_RECOVERY_DIAGNOSTICS['outside_predicted_site'] += 1
+                continue
+            if not _slot_shape_ok_v17(d, area_limits, seed=False):
+                _V30_SLOT_RECOVERY_DIAGNOSTICS['area_or_shape_qc'] += 1
+                continue
+            score = _slot_candidate_site_score_v17(d, cx, cy, xt, yt) + 0.08 * abs(fraction - 0.5)
+            if best is None or score < best[0]:
+                best = (score, d)
+    if best is None:
+        return None
+    _V30_SLOT_RECOVERY_DIAGNOSTICS['flatfield_recovered'] += 1
+    return _mark_source(best[1], 'slot_v30_flatfield_recovered')
+
+
 def _recover_local_slot_v18_deep(
+    gray, expected_xy, x_pitch, row_pitch, expected_w, expected_h, area_limits, aggressive_level,
+) -> Optional[ShapeDesc]:
+    d = _v30_recover_flatfield_slot(gray, expected_xy, x_pitch, row_pitch, expected_w, expected_h, area_limits)
+    if d is not None:
+        return d
+    d = _recover_local_slot_v18_legacy(gray, expected_xy, x_pitch, row_pitch, expected_w, expected_h, area_limits, aggressive_level)
+    _V30_SLOT_RECOVERY_DIAGNOSTICS['legacy_recovered' if d is not None else 'site_not_recovered'] += 1
+    return d
+
+
+def _recover_local_slot_v18_legacy(
     gray: np.ndarray,
     expected_xy: Tuple[float,float],
     x_pitch: float,
@@ -6439,6 +6569,12 @@ def _slot_four_row_array_v18(
     if row_model is None:
         return [],[],meta
     row_centers=np.asarray(row_model['row_centers'],dtype=float); row_pitch=float(row_model['row_pitch']); row_tol=float(row_model['row_tol'])
+    # Calibrate supported rows independently; a slightly displaced bottom row
+    # should not be searched repeatedly at an extrapolated arithmetic position.
+    supported_rows = _assign_to_row_centers_v17(model_cands, row_centers, min(row_tol, 0.42 * row_pitch))
+    for r, items in supported_rows.items():
+        if len(items) >= 2:
+            row_centers[r] = float(np.median([d.center[1] for d in items]))
     fit_cands=_dedup_desc_list_v16(model_cands+lowgray_loc)
     row_map=_assign_to_row_centers_v17(fit_cands,row_centers,row_tol)
     # Prefer shape-valid candidates for H pitch; only use low-gray locators if necessary.
@@ -6456,6 +6592,8 @@ def _slot_four_row_array_v18(
     if not np.isfinite(phase):
         phase,_=_fit_slot_phase_model_v17(row_map,hp,False)
     if not np.isfinite(phase): return [],[],meta
+
+    print(f"      [{image_name}] V30 slot grid: rows={np.round(row_centers, 1).tolist()}, x_pitch={hp:.1f}, y_pitch={row_pitch:.1f}", flush=True)
 
     widths=[max(1.0,_contour_xy_bounds(d)[1]-_contour_xy_bounds(d)[0]) for d in model_cands]
     heights=[max(1.0,_contour_xy_bounds(d)[3]-_contour_xy_bounds(d)[2]) for d in model_cands]
@@ -6479,6 +6617,13 @@ def _slot_four_row_array_v18(
         for si,ex in enumerate(expected_by_row[r]):
             d=_pick_pool_slot_at_site_v17(pool,selected,ex,ey,x_tol,y_tol,area_limits)
             if d is None: continue
+            # Global masks localize sites but can clip a weak slot on a brightness
+            # ramp. Re-extract its contour against the local fitted background
+            # before measuring; the same area/completeness/shape QC still applies.
+            refined = _v30_recover_flatfield_slot(gray, (ex, ey), hp, row_pitch, med_w, global_h, area_limits)
+            if refined is not None:
+                d = refined
+                _V30_SLOT_RECOVERY_DIAGNOSTICS['existing_site_refined'] += 1
             if _source_of(d)=='primary': _mark_source(d,'slot_4row_selected')
             selected.append(d); row_ids.append(r+1); used_sites.add((r,si))
 
@@ -6495,7 +6640,7 @@ def _slot_four_row_array_v18(
                 if (r,si) in used_sites: continue
                 attempts+=1
                 if attempts==1 or attempts%V17_SLOT_PROGRESS_EVERY==0:
-                    print(f"      [{image_name}] V18短槽4行深度补点 {attempts}; pass={pass_no}; row={r+1}; recovered={recovered} ...",flush=True)
+                    print(f"      [{image_name}] V30 slot recovery: attempts={attempts}; pass={pass_no}; row={r+1}; recovered={recovered} ...",flush=True)
                 # Existing pool first: center tolerance can be broad, but shape/area cannot.
                 d=_pick_pool_slot_at_site_v17(pool,selected,ex,ey,(1.10+0.08*pass_no)*x_tol,(1.10+0.06*pass_no)*y_tol,area_limits)
                 if d is None:
@@ -6507,6 +6652,7 @@ def _slot_four_row_array_v18(
         if gained==0: no_progress+=1
         else: no_progress=0
         counts_after=[sum(1 for rr in row_ids if rr==r+1) for r in range(4)]
+        print(f"      [{image_name}] V30 pass {pass_no}: added={gained}, rows={counts_after}, diagnostics={dict(_V30_SLOT_RECOVERY_DIAGNOSTICS)}", flush=True)
         # Stop early only when every row is already close to the known ~10-per-row layout.
         if min(counts_after)>=max(7,V18_SLOT_TARGET_APPROX_PER_ROW-2):
             break
@@ -6535,7 +6681,12 @@ def _slot_four_row_array_v18(
 def measure_slot_v18(
     gray: np.ndarray, pool: List[ShapeDesc], px_nm: float, image_name: str, condition: str
 ) -> Tuple[List[dict],List[ShapeDesc],Dict[int,ShapeDesc],List[dict],Dict[str,object]]:
-    """V18 short-slot: hard 4-row layout + blur/contrast-only deep recovery."""
+    """V30 short-slot: flatfield candidates + four-row/complete-column QC."""
+    _V30_SLOT_RECOVERY_DIAGNOSTICS.clear()
+    print(f"      [{image_name}] V30 slot background-corrected candidate search ...", flush=True)
+    flatfield = _v30_slot_flatfield_candidates(gray, pool)
+    pool, flatfield_added = merge_candidate_descs_v12(pool, flatfield, 'slot')
+    print(f"      [{image_name}] V30 flatfield candidates={len(flatfield)}, added={flatfield_added}, pool={len(pool)}", flush=True)
     strict,rejects,reg_by_id,mean_area,med_area,_=_slot_initial_filter_v12(pool)
     strict=_dedup_desc_list_v16(strict)
     if np.isfinite(mean_area) and mean_area>0:
@@ -6559,6 +6710,9 @@ def measure_slot_v18(
         extra=[d for d in pool if _slot_shape_ok_v17(d,area_limits,seed=True)]
         strict=_dedup_desc_list_v16(strict+extra)
     selected,row_ids,meta=_slot_four_row_array_v18(gray,pool,strict,image_name,area_limits)
+    meta['slot_v30_flatfield_candidates'] = len(flatfield)
+    meta['slot_v30_flatfield_added'] = flatfield_added
+    meta.update({f'slot_v30_{key}': count for key, count in _V30_SLOT_RECOVERY_DIAGNOSTICS.items()})
 
     rows=[]; reps={}
     for oid,(d,rid) in enumerate(zip(selected,row_ids),1):
@@ -11644,9 +11798,9 @@ def _process_one_image_v19(
 
 
 # ============================================================================
-# V29: 0830/0831 MATCHED-COUNT MULTIFORMAT BEFORE/AFTER PIPELINE -- V25 ONLY
+# V30: MULTIFORMAT PIPELINE -- SLOT RECOVERY AND HARD PER-IMAGE TIMEOUT
 # ============================================================================
-# This section intentionally reuses ONLY the V25 algorithms defined above.
+# V25 trench/via and measurement rules are retained; V30 improves slot localization.
 # No sem_cd_measure_200k_batch_V1_6.py code, import, or measurement rule is used.
 #
 # Dataset mapping per condition folder (natural filename order):
@@ -11662,42 +11816,46 @@ def _process_one_image_v19(
 #
 # Before/after pairing is by condition + region + pattern, NOT by equal filename.
 
-import argparse as _argparse_v29
-import json as _json_v29
-import traceback as _traceback_v29
-from typing import Any as _Any_v29, Iterable as _Iterable_v29, Sequence as _Sequence_v29
+import argparse as _argparse_v30
+import json as _json_v30
+import traceback as _traceback_v30
+import pickle as _pickle_v30
+import shutil as _shutil_v30
+import subprocess as _subprocess_v30
+import tempfile as _tempfile_v30
+from typing import Any as _Any_v30, Iterable as _Iterable_v30, Sequence as _Sequence_v30
 
 try:
-    from scipy.optimize import linear_sum_assignment as _linear_sum_assignment_v29
-except ImportError as _exc_v29:
+    from scipy.optimize import linear_sum_assignment as _linear_sum_assignment_v30
+except ImportError as _exc_v30:
     raise SystemExit(
-        "V29 需要 scipy（逐对象 before/after 配对使用）。请运行：\n"
+        "V30 需要 scipy（逐对象 before/after 配对使用）。请运行：\n"
         "  pip install numpy pandas scipy opencv-python matplotlib openpyxl\n"
-        f"原始错误：{_exc_v29}"
-    ) from _exc_v29
+        f"原始错误：{_exc_v30}"
+    ) from _exc_v30
 
 
-V29_SCRIPT_VERSION = "2026-09-23-V29-AFTER-NUMERIC-FOLDERS-MATCHED-COUNT-MULTIFORMAT-V25-ONLY"
-V29_DEFAULT_BEFORE_ROOT = Path(r"C:\Users\z00027644\Documents\倾斜刻蚀\SEM\830SEM_before_treat")
-V29_DEFAULT_AFTER_ROOT = Path(r"C:\Users\z00027644\Documents\倾斜刻蚀\SEM\0831SEM_10-14_topview_after")
-V29_FIRST_REGION = 2
-V29_PATTERN_SEQUENCE = ("trench", "slot", "via")
-V29_STAGES = ("before", "after")
-V29_STAGE_ZH = {"before": "处理前", "after": "处理后"}
-V29_PATTERN_ZH = {"trench": "Trench", "slot": "Slot最下排", "via": "Via"}
-V29_IMAGE_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
+V30_SCRIPT_VERSION = "2026-09-23-V30-SLOT-FLATFIELD-RECOVERY-IMAGE-TIMEOUT"
+V30_DEFAULT_BEFORE_ROOT = Path(r"C:\Users\z00027644\Documents\倾斜刻蚀\SEM\830SEM_before_treat")
+V30_DEFAULT_AFTER_ROOT = Path(r"C:\Users\z00027644\Documents\倾斜刻蚀\SEM\0831SEM_10-14_topview_after")
+V30_FIRST_REGION = 2
+V30_PATTERN_SEQUENCE = ("trench", "slot", "via")
+V30_STAGES = ("before", "after")
+V30_STAGE_ZH = {"before": "处理前", "after": "处理后"}
+V30_PATTERN_ZH = {"trench": "Trench", "slot": "Slot最下排", "via": "Via"}
+V30_IMAGE_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
 
 # V25 internal pattern keys. Trench/slot are fixed. Via is auto-selected from V25's
 # own via40/via60 models unless the user forces one with --via-pattern.
-V29_FIXED_PATTERN_KEY = {
+V30_FIXED_PATTERN_KEY = {
     "trench": "trench160",
     "slot": "slot210",
 }
-V29_VIA_KEYS = ("via40", "via60")
-V29_VIA_NOMINAL_NM = {"via40": 40.0, "via60": 60.0}
+V30_VIA_KEYS = ("via40", "via60")
+V30_VIA_NOMINAL_NM = {"via40": 40.0, "via60": 60.0}
 
 # Requested output metrics.
-V29_METRIC_SPECS = {
+V30_METRIC_SPECS = {
     "trench": [
         ("x_width_nm", "trench_width_nm", "Trench宽度"),
         ("tip_gap_y_nm", "tip_to_tip_y_nm", "Tip-to-tip Y距离"),
@@ -11714,19 +11872,19 @@ V29_METRIC_SPECS = {
 
 # Per-object normalized-position matching thresholds. This matching is ONLY for
 # comparison tables; it does not change any V25 detection or measurement result.
-V29_MATCH_THRESHOLD_VIA = 0.30
-V29_MATCH_THRESHOLD_1D = 0.28
+V30_MATCH_THRESHOLD_VIA = 0.30
+V30_MATCH_THRESHOLD_1D = 0.28
 
 
 # -----------------------------------------------------------------------------
-# V29 generic helpers
+# V30 generic helpers
 # -----------------------------------------------------------------------------
-def _v29_condition_key(condition: str) -> tuple:
+def _v30_condition_key(condition: str) -> tuple:
     name = str(condition)
     return int(name), name
 
 
-def _v29_discover_conditions(after_root: Path) -> List[str]:
+def _v30_discover_conditions(after_root: Path) -> List[str]:
     """Use exact digit-only folder names under AFTER as the condition list."""
     after_root = Path(after_root)
     if not after_root.exists():
@@ -11735,7 +11893,7 @@ def _v29_discover_conditions(after_root: Path) -> List[str]:
         raise NotADirectoryError(f"after 路径不是文件夹：{after_root}")
     conditions = sorted(
         [p.name for p in after_root.iterdir() if p.is_dir() and re.fullmatch(r"[0-9]+", p.name)],
-        key=_v29_condition_key,
+        key=_v30_condition_key,
     )
     if not conditions:
         raise ValueError(
@@ -11745,19 +11903,19 @@ def _v29_discover_conditions(after_root: Path) -> List[str]:
     return conditions
 
 
-def _v29_sort_conditions(df: pd.DataFrame, columns: _Sequence_v29[str]) -> pd.DataFrame:
+def _v30_sort_conditions(df: pd.DataFrame, columns: _Sequence_v30[str]) -> pd.DataFrame:
     """Sort condition names numerically while retaining exact names, e.g. 007."""
     if df.empty:
         return df
     out = df.copy()
-    names = sorted(out["condition"].astype(str).unique(), key=_v29_condition_key)
+    names = sorted(out["condition"].astype(str).unique(), key=_v30_condition_key)
     order = {name: index for index, name in enumerate(names)}
-    out["_condition_order_v29"] = out["condition"].astype(str).map(order)
-    sort_columns = ["_condition_order_v29"] + [c for c in columns if c != "condition"]
-    return out.sort_values(sort_columns, kind="stable").drop(columns=["_condition_order_v29"]).reset_index(drop=True)
+    out["_condition_order_v30"] = out["condition"].astype(str).map(order)
+    sort_columns = ["_condition_order_v30"] + [c for c in columns if c != "condition"]
+    return out.sort_values(sort_columns, kind="stable").drop(columns=["_condition_order_v30"]).reset_index(drop=True)
 
 
-def _v29_finite_float(value: _Any_v29, default: float = math.nan) -> float:
+def _v30_finite_float(value: _Any_v30, default: float = math.nan) -> float:
     try:
         x = float(value)
     except Exception:
@@ -11765,37 +11923,37 @@ def _v29_finite_float(value: _Any_v29, default: float = math.nan) -> float:
     return x if np.isfinite(x) else default
 
 
-def _v29_safe_mean(values: _Iterable_v29) -> float:
+def _v30_safe_mean(values: _Iterable_v30) -> float:
     a = pd.to_numeric(pd.Series(list(values), dtype="object"), errors="coerce").dropna().to_numpy(float)
     return float(np.mean(a)) if len(a) else math.nan
 
 
-def _v29_safe_median(values: _Iterable_v29) -> float:
+def _v30_safe_median(values: _Iterable_v30) -> float:
     a = pd.to_numeric(pd.Series(list(values), dtype="object"), errors="coerce").dropna().to_numpy(float)
     return float(np.median(a)) if len(a) else math.nan
 
 
-def _v29_natural_key(path: Path) -> tuple:
+def _v30_natural_key(path: Path) -> tuple:
     parts = re.split(r"(\d+)", path.stem.lower())
     return (tuple(int(p) if p.isdigit() else p for p in parts), path.name.lower(), path.name)
 
 
-def _v29_df(rows) -> pd.DataFrame:
+def _v30_df(rows) -> pd.DataFrame:
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
-def _v29_write_csv(df: pd.DataFrame, path: Path) -> None:
+def _v30_write_csv(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, index=False, encoding="utf-8-sig")
 
 
-def _v29_expected_positions(image_count: int) -> List[dict]:
+def _v30_expected_positions(image_count: int) -> List[dict]:
     """Extend the original trench/slot/via order to every discovered image."""
     return [
         {
             "sequence_index": index + 1,
-            "region": V29_FIRST_REGION + index // len(V29_PATTERN_SEQUENCE),
-            "pattern": V29_PATTERN_SEQUENCE[index % len(V29_PATTERN_SEQUENCE)],
+            "region": V30_FIRST_REGION + index // len(V30_PATTERN_SEQUENCE),
+            "pattern": V30_PATTERN_SEQUENCE[index % len(V30_PATTERN_SEQUENCE)],
         }
         for index in range(image_count)
     ]
@@ -11804,7 +11962,7 @@ def _v29_expected_positions(image_count: int) -> List[dict]:
 # -----------------------------------------------------------------------------
 # Inventory / natural-order mapping with matching before/after counts
 # -----------------------------------------------------------------------------
-def _v29_discover_one_condition(stage: str, root: Path, condition: str):
+def _v30_discover_one_condition(stage: str, root: Path, condition: str):
     folder = Path(root) / str(condition)
     rows: List[dict] = []
     errors: List[dict] = []
@@ -11819,11 +11977,11 @@ def _v29_discover_one_condition(stage: str, root: Path, condition: str):
         return rows, errors
 
     images = sorted(
-        [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in V29_IMAGE_SUFFIXES],
-        key=_v29_natural_key,
+        [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in V30_IMAGE_SUFFIXES],
+        key=_v30_natural_key,
     )
 
-    for pos, image_path in zip(_v29_expected_positions(len(images)), images):
+    for pos, image_path in zip(_v30_expected_positions(len(images)), images):
         # Validate same-stem TXT + PixelSize now, but leave actual parsing to the exact V25
         # read_pixel_size_nm() again during measurement.
         txt_path = image_path.with_suffix(".txt")
@@ -11847,12 +12005,12 @@ def _v29_discover_one_condition(stage: str, root: Path, condition: str):
 
         rows.append({
             "stage": stage,
-            "stage_zh": V29_STAGE_ZH[stage],
+            "stage_zh": V30_STAGE_ZH[stage],
             "condition": str(condition),
             "condition_label": f"Condition {condition}",
             "region": int(pos["region"]),
             "pattern": str(pos["pattern"]),
-            "pattern_zh": V29_PATTERN_ZH[str(pos["pattern"])],
+            "pattern_zh": V30_PATTERN_ZH[str(pos["pattern"])],
             "sequence_index": int(pos["sequence_index"]),
             "image": image_path.name,
             "path": str(image_path),
@@ -11865,17 +12023,17 @@ def _v29_discover_one_condition(stage: str, root: Path, condition: str):
     return rows, errors
 
 
-def _v29_build_inventory(
-    before_root: Path, after_root: Path, conditions: Optional[_Sequence_v29[str]] = None,
+def _v30_build_inventory(
+    before_root: Path, after_root: Path, conditions: Optional[_Sequence_v30[str]] = None,
 ):
     if conditions is None:
-        conditions = _v29_discover_conditions(after_root)
+        conditions = _v30_discover_conditions(after_root)
     rows: List[dict] = []
     errors: List[dict] = []
     for condition in conditions:
         condition = str(condition)
-        before_rows, before_errors = _v29_discover_one_condition("before", before_root, condition)
-        after_rows, after_errors = _v29_discover_one_condition("after", after_root, condition)
+        before_rows, before_errors = _v30_discover_one_condition("before", before_root, condition)
+        after_rows, after_errors = _v30_discover_one_condition("after", after_root, condition)
         condition_errors = before_errors + after_errors
         errors.extend(condition_errors)
         if any(e["error_type"] == "MISSING_CONDITION_FOLDER" for e in condition_errors):
@@ -11901,14 +12059,14 @@ def _v29_build_inventory(
     inv = pd.DataFrame(rows)
     err = pd.DataFrame(errors)
     if not inv.empty:
-        inv = _v29_sort_conditions(inv, ["condition", "region", "sequence_index", "stage"])
+        inv = _v30_sort_conditions(inv, ["condition", "region", "sequence_index", "stage"])
     return inv, err
 
 
 # -----------------------------------------------------------------------------
 # Exact V25 processing with an externally assigned pattern key
 # -----------------------------------------------------------------------------
-def _v29_process_v25_assigned(
+def _v30_process_v25_assigned(
     image_path: Path,
     stage: str,
     condition: str,
@@ -11917,13 +12075,7 @@ def _v29_process_v25_assigned(
     v25_pattern_key: str,
     ann_dir: Path,
 ):
-    """Run V25's FINAL _process_one_image_v19 unchanged except filename classification.
-
-    The current 1_xxxx names do not encode 40/60/160/210. We therefore temporarily
-    override ONLY the filename classifier. Segmentation, candidate construction,
-    edge search, shape QC, lattice/column logic, measurement, and V25 automatic
-    zero-result fallback are all the exact V25 functions above.
-    """
+    """Assign pattern keys to the embedded pipeline, including V30 slot recovery."""
     if v25_pattern_key not in PATTERN_KEYS_V19:
         raise ValueError(f"非法 V25 pattern key: {v25_pattern_key}")
 
@@ -11953,22 +12105,22 @@ def _v29_process_v25_assigned(
         r = dict(r0)
         r["source_pattern_key"] = r.get("pattern", v25_pattern_key)
         r["pattern"] = public_pattern
-        r["pattern_zh"] = V29_PATTERN_ZH[public_pattern]
+        r["pattern_zh"] = V30_PATTERN_ZH[public_pattern]
         r["region"] = int(region)
         r["pair_key"] = pair_key
-        r["source_algorithm"] = "V25_auto_fallback_only"
-        r["x_width_nm"] = _v29_finite_float(r.get("x_width_nm"))
-        r["y_height_nm"] = _v29_finite_float(r.get("y_height_nm"))
-        r["tip_gap_y_nm"] = _v29_finite_float(r.get("tip_gap_y_nm"))
+        r["source_algorithm"] = "V30_slot_recovery" if public_pattern == "slot" else "V25_auto_fallback_only"
+        r["x_width_nm"] = _v30_finite_float(r.get("x_width_nm"))
+        r["y_height_nm"] = _v30_finite_float(r.get("y_height_nm"))
+        r["tip_gap_y_nm"] = _v30_finite_float(r.get("tip_gap_y_nm"))
         normalized_rows.append(r)
 
     status = dict(status)
     status["source_pattern_key"] = status.get("pattern", v25_pattern_key)
     status["pattern"] = public_pattern
-    status["pattern_zh"] = V29_PATTERN_ZH[public_pattern]
+    status["pattern_zh"] = V30_PATTERN_ZH[public_pattern]
     status["region"] = int(region)
     status["pair_key"] = pair_key
-    status["source_algorithm"] = "V25_auto_fallback_only"
+    status["source_algorithm"] = "V30_slot_recovery" if public_pattern == "slot" else "V25_auto_fallback_only"
 
     normalized_rejects: List[dict] = []
     for q0 in rejects:
@@ -11977,7 +12129,7 @@ def _v29_process_v25_assigned(
         q["pattern"] = public_pattern
         q["region"] = int(region)
         q["pair_key"] = pair_key
-        q["source_algorithm"] = "V25_auto_fallback_only"
+        q["source_algorithm"] = "V30_slot_recovery" if public_pattern == "slot" else "V25_auto_fallback_only"
         normalized_rejects.append(q)
 
     return normalized_rows, status, normalized_rejects
@@ -11986,7 +12138,7 @@ def _v29_process_v25_assigned(
 # -----------------------------------------------------------------------------
 # Via40 / Via60 model choice using V25 ONLY
 # -----------------------------------------------------------------------------
-def _v29_via_trial_quality(rows: List[dict], status: dict, key: str) -> tuple:
+def _v30_via_trial_quality(rows: List[dict], status: dict, key: str) -> tuple:
     """Lexicographic quality used only to choose V25 via40 vs via60 on BEFORE.
 
     Measurement itself is untouched V25. Higher is better.
@@ -11996,18 +12148,18 @@ def _v29_via_trial_quality(rows: List[dict], status: dict, key: str) -> tuple:
 
     df = pd.DataFrame(rows)
     n = int(len(df))
-    fallback_level = int(_v29_finite_float(status.get("auto_fallback_level_used", 0), 0.0))
+    fallback_level = int(_v30_finite_float(status.get("auto_fallback_level_used", 0), 0.0))
     strict = 1 if fallback_level == 0 else 0
-    occupancy = _v29_finite_float(status.get("measure_array_occupancy_seed"), -1.0)
-    good_ray = _v29_safe_mean(df.get("via_good_ray_fraction", pd.Series(dtype=float)).tolist())
-    scale_score = _v29_safe_mean(df.get("via_scale_match_score", pd.Series(dtype=float)).tolist())
-    leak = _v29_safe_mean(df.get("via_outer_dark_leak_fraction", pd.Series(dtype=float)).tolist())
+    occupancy = _v30_finite_float(status.get("measure_array_occupancy_seed"), -1.0)
+    good_ray = _v30_safe_mean(df.get("via_good_ray_fraction", pd.Series(dtype=float)).tolist())
+    scale_score = _v30_safe_mean(df.get("via_scale_match_score", pd.Series(dtype=float)).tolist())
+    leak = _v30_safe_mean(df.get("via_outer_dark_leak_fraction", pd.Series(dtype=float)).tolist())
 
     x = pd.to_numeric(df.get("x_width_nm", pd.Series(dtype=float)), errors="coerce")
     y = pd.to_numeric(df.get("y_height_nm", pd.Series(dtype=float)), errors="coerce")
     d = (0.5 * (x + y)).dropna().to_numpy(float)
     med = float(np.median(d)) if len(d) else math.nan
-    nominal = V29_VIA_NOMINAL_NM[key]
+    nominal = V30_VIA_NOMINAL_NM[key]
     nominal_rel_error = abs(med - nominal) / nominal if np.isfinite(med) else 99.0
 
     # First ensure a repeated valid array, then favor strict V25 detection, lattice
@@ -12023,14 +12175,14 @@ def _v29_via_trial_quality(rows: List[dict], status: dict, key: str) -> tuple:
     )
 
 
-def _v29_choose_via_key_from_before(
+def _v30_choose_via_key_from_before(
     before_path: Path,
     condition: str,
     region: int,
     trial_root: Path,
     forced: str,
 ):
-    if forced in V29_VIA_KEYS:
+    if forced in V30_VIA_KEYS:
         return forced, [{
             "condition": str(condition),
             "region": int(region),
@@ -12045,18 +12197,18 @@ def _v29_choose_via_key_from_before(
     trial_rows: List[dict] = []
     best_key = "via40"
     best_quality = (-1, -1, -1e9, -1e9, -1e9, -1e9, -1e9)
-    for key in V29_VIA_KEYS:
+    for key in V30_VIA_KEYS:
         ann_dir = trial_root / str(condition) / f"Region_{region}" / key
         try:
-            rows, status, _ = _v29_process_v25_assigned(
+            rows, status, _ = _v30_process_v25_assigned(
                 before_path, "before", str(condition), int(region), "via", key, ann_dir
             )
-            quality = _v29_via_trial_quality(rows, status, key)
+            quality = _v30_via_trial_quality(rows, status, key)
             err = ""
             n = len(rows)
-            fallback = int(_v29_finite_float(status.get("auto_fallback_level_used", 0), 0.0))
-            medx = _v29_safe_median(pd.DataFrame(rows).get("x_width_nm", pd.Series(dtype=float)).tolist()) if rows else math.nan
-            medy = _v29_safe_median(pd.DataFrame(rows).get("y_height_nm", pd.Series(dtype=float)).tolist()) if rows else math.nan
+            fallback = int(_v30_finite_float(status.get("auto_fallback_level_used", 0), 0.0))
+            medx = _v30_safe_median(pd.DataFrame(rows).get("x_width_nm", pd.Series(dtype=float)).tolist()) if rows else math.nan
+            medy = _v30_safe_median(pd.DataFrame(rows).get("y_height_nm", pd.Series(dtype=float)).tolist()) if rows else math.nan
         except Exception as exc:
             quality = (-1, -1, -1e9, -1e9, -1e9, -1e9, -1e9)
             err = f"{type(exc).__name__}: {exc}"
@@ -12070,7 +12222,7 @@ def _v29_choose_via_key_from_before(
             "region": int(region),
             "before_image": before_path.name,
             "trial_pattern_key": key,
-            "trial_nominal_nm": V29_VIA_NOMINAL_NM[key],
+            "trial_nominal_nm": V30_VIA_NOMINAL_NM[key],
             "mode": "AUTO_V25_ONLY",
             "selected": False,
             "n_measurements": n,
@@ -12092,7 +12244,7 @@ def _v29_choose_via_key_from_before(
 # -----------------------------------------------------------------------------
 # Image-level statistics and before/after comparison
 # -----------------------------------------------------------------------------
-def _v29_build_image_metrics(objects_df: pd.DataFrame) -> pd.DataFrame:
+def _v30_build_image_metrics(objects_df: pd.DataFrame) -> pd.DataFrame:
     if objects_df.empty:
         return pd.DataFrame()
     records: List[dict] = []
@@ -12103,7 +12255,7 @@ def _v29_build_image_metrics(objects_df: pd.DataFrame) -> pd.DataFrame:
     for keys, g in objects_df.groupby(group_cols, dropna=False, sort=True):
         base = dict(zip(group_cols, keys if isinstance(keys, tuple) else (keys,)))
         pattern = str(base["pattern"])
-        for source_col, metric, metric_zh in V29_METRIC_SPECS[pattern]:
+        for source_col, metric, metric_zh in V30_METRIC_SPECS[pattern]:
             vals = pd.to_numeric(g.get(source_col, pd.Series(dtype=float)), errors="coerce").dropna().to_numpy(float)
             if not len(vals):
                 continue
@@ -12120,10 +12272,10 @@ def _v29_build_image_metrics(objects_df: pd.DataFrame) -> pd.DataFrame:
                 "min_nm": float(np.min(vals)),
                 "max_nm": float(np.max(vals)),
             })
-    return _v29_sort_conditions(pd.DataFrame(records), ["condition", "region", "pattern", "stage", "image", "metric"])
+    return _v30_sort_conditions(pd.DataFrame(records), ["condition", "region", "pattern", "stage", "image", "metric"])
 
 
-def _v29_build_image_pair_comparison(image_metrics: pd.DataFrame) -> pd.DataFrame:
+def _v30_build_image_pair_comparison(image_metrics: pd.DataFrame) -> pd.DataFrame:
     if image_metrics.empty:
         return pd.DataFrame()
     idx = [
@@ -12131,7 +12283,7 @@ def _v29_build_image_pair_comparison(image_metrics: pd.DataFrame) -> pd.DataFram
         "pattern_zh", "metric", "metric_zh", "source_column",
     ]
     out = image_metrics[idx].drop_duplicates().copy()
-    for stage in V29_STAGES:
+    for stage in V30_STAGES:
         s = image_metrics[image_metrics["stage"] == stage].copy()
         keep = idx + ["image", "n", "mean_nm", "std_nm", "sem_nm", "median_nm", "min_nm", "max_nm"]
         s = s[keep].rename(columns={
@@ -12156,19 +12308,19 @@ def _v29_build_image_pair_comparison(image_metrics: pd.DataFrame) -> pd.DataFram
         np.nan,
     )
 
-    porder = {p: i for i, p in enumerate(V29_PATTERN_SEQUENCE)}
+    porder = {p: i for i, p in enumerate(V30_PATTERN_SEQUENCE)}
     out["_po"] = out["pattern"].map(porder).fillna(999)
-    out = _v29_sort_conditions(out, ["condition", "region", "_po", "metric"]).drop(columns=["_po"])
+    out = _v30_sort_conditions(out, ["condition", "region", "_po", "metric"]).drop(columns=["_po"])
     return out
 
 
-def _v29_build_overall_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
+def _v30_build_overall_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
     """Pool all discovered regions per condition, separate from image-by-image comparison."""
     if objects_df.empty:
         return pd.DataFrame()
     long_rows: List[dict] = []
     for (stage, condition, pattern), g in objects_df.groupby(["stage", "condition", "pattern"], sort=True):
-        for source_col, metric, metric_zh in V29_METRIC_SPECS[str(pattern)]:
+        for source_col, metric, metric_zh in V30_METRIC_SPECS[str(pattern)]:
             vals = pd.to_numeric(g.get(source_col, pd.Series(dtype=float)), errors="coerce").dropna().to_numpy(float)
             if not len(vals):
                 continue
@@ -12177,7 +12329,7 @@ def _v29_build_overall_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
                 "condition": str(condition),
                 "condition_label": f"Condition {condition}",
                 "pattern": pattern,
-                "pattern_zh": V29_PATTERN_ZH[str(pattern)],
+                "pattern_zh": V30_PATTERN_ZH[str(pattern)],
                 "metric": metric,
                 "metric_zh": metric_zh,
                 "source_column": source_col,
@@ -12191,7 +12343,7 @@ def _v29_build_overall_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
         return long
     idx = ["condition", "condition_label", "pattern", "pattern_zh", "metric", "metric_zh", "source_column"]
     out = long[idx].drop_duplicates().copy()
-    for stage in V29_STAGES:
+    for stage in V30_STAGES:
         s = long[long["stage"] == stage][idx + ["n", "mean_nm", "std_nm", "median_nm"]].rename(columns={
             "n": f"{stage}_n",
             "mean_nm": f"{stage}_mean_nm",
@@ -12203,13 +12355,13 @@ def _v29_build_overall_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
     a = pd.to_numeric(out.get("after_mean_nm"), errors="coerce")
     out["delta_after_minus_before_nm"] = a - b
     out["change_percent"] = np.where(np.isfinite(b) & (np.abs(b) > 1e-12), 100.0 * (a - b) / b, np.nan)
-    return _v29_sort_conditions(out, ["condition", "pattern", "metric"])
+    return _v30_sort_conditions(out, ["condition", "pattern", "metric"])
 
 
 # -----------------------------------------------------------------------------
 # Per-object spatial before/after matching (comparison only)
 # -----------------------------------------------------------------------------
-def _v29_normalized_1d(g: pd.DataFrame) -> np.ndarray:
+def _v30_normalized_1d(g: pd.DataFrame) -> np.ndarray:
     if "center_axis_x_px" in g:
         s = g["center_axis_x_px"]
     elif "center_image_x_px" in g:
@@ -12224,7 +12376,7 @@ def _v29_normalized_1d(g: pd.DataFrame) -> np.ndarray:
     return (x - np.nanmin(x)) / max(np.nanmax(x) - np.nanmin(x), 1e-9)
 
 
-def _v29_normalized_2d(g: pd.DataFrame) -> np.ndarray:
+def _v30_normalized_2d(g: pd.DataFrame) -> np.ndarray:
     out = np.zeros((len(g), 2), float)
     for j, name in enumerate(("center_image_x_px", "center_image_y_px")):
         if name not in g:
@@ -12238,7 +12390,7 @@ def _v29_normalized_2d(g: pd.DataFrame) -> np.ndarray:
     return out
 
 
-def _v29_match_objects(before: pd.DataFrame, after: pd.DataFrame, pattern: str):
+def _v30_match_objects(before: pd.DataFrame, after: pd.DataFrame, pattern: str):
     b = before.copy().reset_index(drop=True)
     a = after.copy().reset_index(drop=True)
     if b.empty:
@@ -12247,15 +12399,15 @@ def _v29_match_objects(before: pd.DataFrame, after: pd.DataFrame, pattern: str):
         return [(b.iloc[i], None, math.nan) for i in range(len(b))]
 
     if pattern == "via":
-        pb, pa = _v29_normalized_2d(b), _v29_normalized_2d(a)
-        threshold = V29_MATCH_THRESHOLD_VIA
+        pb, pa = _v30_normalized_2d(b), _v30_normalized_2d(a)
+        threshold = V30_MATCH_THRESHOLD_VIA
     else:
-        pb = _v29_normalized_1d(b)[:, None]
-        pa = _v29_normalized_1d(a)[:, None]
-        threshold = V29_MATCH_THRESHOLD_1D
+        pb = _v30_normalized_1d(b)[:, None]
+        pa = _v30_normalized_1d(a)[:, None]
+        threshold = V30_MATCH_THRESHOLD_1D
 
     cost = np.linalg.norm(pb[:, None, :] - pa[None, :, :], axis=2)
-    bi, aj = _linear_sum_assignment_v29(cost)
+    bi, aj = _linear_sum_assignment_v30(cost)
     accepted = {}
     used_a = set()
     dist = {}
@@ -12279,7 +12431,7 @@ def _v29_match_objects(before: pd.DataFrame, after: pd.DataFrame, pattern: str):
     return pairs
 
 
-def _v29_build_object_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
+def _v30_build_object_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
     if objects_df.empty:
         return pd.DataFrame()
     records: List[dict] = []
@@ -12297,7 +12449,7 @@ def _v29_build_object_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
         ]
         before = g[g["stage"] == "before"]
         after = g[g["stage"] == "after"]
-        pairs = _v29_match_objects(before, after, pattern)
+        pairs = _v30_match_objects(before, after, pattern)
         for pair_id, (b, a, match_distance) in enumerate(pairs, 1):
             base = {
                 "condition": condition,
@@ -12305,7 +12457,7 @@ def _v29_build_object_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
                 "region": region,
                 "pair_key": pair_key,
                 "pattern": pattern,
-                "pattern_zh": V29_PATTERN_ZH[pattern],
+                "pattern_zh": V30_PATTERN_ZH[pattern],
                 "matched_pair_id": pair_id,
                 "match_distance_normalized": match_distance,
                 "before_object_id": b.get("object_id") if b is not None else math.nan,
@@ -12314,9 +12466,9 @@ def _v29_build_object_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
                 "after_image": a.get("image") if a is not None else "",
                 "match_status": "MATCHED" if b is not None and a is not None else ("BEFORE_ONLY" if b is not None else "AFTER_ONLY"),
             }
-            for source_col, metric, metric_zh in V29_METRIC_SPECS[pattern]:
-                bv = _v29_finite_float(b.get(source_col)) if b is not None else math.nan
-                av = _v29_finite_float(a.get(source_col)) if a is not None else math.nan
+            for source_col, metric, metric_zh in V30_METRIC_SPECS[pattern]:
+                bv = _v30_finite_float(b.get(source_col)) if b is not None else math.nan
+                av = _v30_finite_float(a.get(source_col)) if a is not None else math.nan
                 delta = av - bv if np.isfinite(av) and np.isfinite(bv) else math.nan
                 rec = dict(base)
                 rec.update({
@@ -12328,17 +12480,17 @@ def _v29_build_object_comparison(objects_df: pd.DataFrame) -> pd.DataFrame:
                     "change_percent": 100.0 * delta / bv if np.isfinite(delta) and np.isfinite(bv) and abs(bv) > 1e-12 else math.nan,
                 })
                 records.append(rec)
-    return _v29_sort_conditions(pd.DataFrame(records), ["condition", "region", "pattern", "matched_pair_id", "metric"])
+    return _v30_sort_conditions(pd.DataFrame(records), ["condition", "region", "pattern", "matched_pair_id", "metric"])
 
 
 # -----------------------------------------------------------------------------
 # Plotting
 # -----------------------------------------------------------------------------
-def _v29_safe_plot_name(s: str) -> str:
+def _v30_safe_plot_name(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(s))
 
 
-def _v29_save_pair_plots(pair_df: pd.DataFrame, plot_dir: Path) -> None:
+def _v30_save_pair_plots(pair_df: pd.DataFrame, plot_dir: Path) -> None:
     if pair_df.empty:
         return
     plot_dir.mkdir(parents=True, exist_ok=True)
@@ -12362,7 +12514,7 @@ def _v29_save_pair_plots(pair_df: pd.DataFrame, plot_dir: Path) -> None:
         ax.legend()
         ax.grid(axis="y", alpha=0.25)
         fig.tight_layout()
-        out = plot_dir / f"C{condition}__{pattern}__{_v29_safe_plot_name(metric)}__before_after.png"
+        out = plot_dir / f"C{condition}__{pattern}__{_v30_safe_plot_name(metric)}__before_after.png"
         fig.savefig(out, dpi=220)
         plt.close(fig)
 
@@ -12370,7 +12522,7 @@ def _v29_save_pair_plots(pair_df: pd.DataFrame, plot_dir: Path) -> None:
     for (pattern, metric), g in pair_df.groupby(["pattern", "metric"], sort=True):
         g = g.copy()
         g["label"] = g.apply(lambda r: f"C{r['condition']}-R{int(r['region'])}", axis=1)
-        g = _v29_sort_conditions(g, ["condition", "region"])
+        g = _v30_sort_conditions(g, ["condition", "region"])
         d = pd.to_numeric(g["delta_after_minus_before_nm"], errors="coerce").to_numpy(float)
         x = np.arange(len(g), dtype=float)
         fig, ax = plt.subplots(figsize=(max(9.0, 0.55 * len(g)), 5.2))
@@ -12381,26 +12533,167 @@ def _v29_save_pair_plots(pair_df: pd.DataFrame, plot_dir: Path) -> None:
         ax.set_title(f"{str(pattern).upper()} | {metric} | Before/After delta")
         ax.grid(axis="y", alpha=0.25)
         fig.tight_layout()
-        out = plot_dir / f"ALL__{pattern}__{_v29_safe_plot_name(metric)}__delta.png"
+        out = plot_dir / f"ALL__{pattern}__{_v30_safe_plot_name(metric)}__delta.png"
         fig.savefig(out, dpi=220)
         plt.close(fig)
 
 
 # -----------------------------------------------------------------------------
-# Main V29 pipeline
+# Main V30 pipeline
 # -----------------------------------------------------------------------------
-def main_v29(
+class V30ImageTimeout(TimeoutError):
+    """The image's complete processing budget, including via trials, expired."""
+
+
+def _v30_measure_image_job(job: dict):
+    """Run inside one disposable worker; return only exportable data."""
+    image_path = Path(job['image_path'])
+    ann_dir = Path(job['ann_dir'])
+    stage, pattern = job['stage'], job['public_pattern']
+    key = job.get('v25_pattern_key')
+    trials = []
+    if pattern == 'via' and stage == 'before' and not key:
+        best = None
+        for candidate_key in V30_VIA_KEYS:
+            try:
+                payload = _v30_process_v25_assigned(
+                    image_path, stage, job['condition'], job['region'], pattern,
+                    candidate_key, ann_dir / '_via_trials' / candidate_key)
+                quality = _v30_via_trial_quality(payload[0], payload[1], candidate_key)
+                trials.append(dict(trial_pattern_key=candidate_key, n_measurements=len(payload[0]),
+                                   quality_key=repr(quality), error='',
+                                   fallback_level=int(_v30_finite_float(payload[1].get('auto_fallback_level_used', 0), 0)),
+                                   median_x_width_nm=_v30_safe_median([r.get('x_width_nm', np.nan) for r in payload[0]]),
+                                   median_y_height_nm=_v30_safe_median([r.get('y_height_nm', np.nan) for r in payload[0]])))
+                if best is None or quality > best[0]:
+                    best = (quality, candidate_key, payload)
+            except Exception as exc:
+                trials.append(dict(trial_pattern_key=candidate_key, n_measurements=0,
+                                   quality_key='', error=f'{type(exc).__name__}: {exc}'))
+        if best is None:
+            raise RuntimeError(f'Both V25 via trials failed: {trials}')
+        _, key, payload = best
+        rows, status, rejects = payload
+        # Reuse the winning trial. A second run would spend the same image budget
+        # again and could yield a different stochastic segmentation.
+        status = dict(status)
+        annotation = Path(status['annotated_path']) if status.get('annotated_path') else None
+        if annotation is not None and annotation.is_file():
+            selected_path = ann_dir / annotation.name
+            _shutil_v30.copy2(annotation, selected_path)
+            status['annotated_path'] = str(selected_path)
+    else:
+        if key not in PATTERN_KEYS_V19:
+            raise ValueError(f'No valid pattern model for {image_path.name}: {key}')
+        rows, status, rejects = _v30_process_v25_assigned(
+            image_path, stage, job['condition'], job['region'], pattern, key, ann_dir)
+        if pattern == 'via' and stage == 'before':
+            trials.append(dict(trial_pattern_key=key, n_measurements=len(rows), quality_key='forced', error=''))
+    for trial in trials:
+        trial.update(condition=job['condition'], region=job['region'], before_image=image_path.name,
+                     selected=trial['trial_pattern_key'] == key,
+                     trial_nominal_nm=V30_VIA_NOMINAL_NM[trial['trial_pattern_key']],
+                     mode='AUTO_V25_ONLY' if not job.get('v25_pattern_key') else 'FORCED')
+        for field in ('fallback_level', 'median_x_width_nm', 'median_y_height_nm'):
+            trial.setdefault(field, math.nan)
+    return rows, status, rejects, key, trials
+
+
+def _v30_worker_main(request_path: str) -> int:
+    request = _json_v30.loads(Path(request_path).read_text(encoding='utf-8'))
+    try:
+        result = {'ok': True, 'payload': _v30_measure_image_job(request)}
+    except Exception as exc:
+        result = {'ok': False, 'error': f'{type(exc).__name__}: {exc}',
+                  'traceback': _traceback_v30.format_exc()}
+    with Path(request['result_path']).open('wb') as stream:
+        _pickle_v30.dump(result, stream, protocol=_pickle_v30.HIGHEST_PROTOCOL)
+    return 0
+
+
+def _v30_process_image_with_timeout(
+    image_path: Path, stage: str, condition: str, region: int,
+    public_pattern: str, v25_pattern_key: Optional[str], ann_dir: Path,
+    timeout_seconds: float = 300.0,
+):
+    """Hard per-image wall clock limit, portable to Windows and native OpenCV."""
+    if not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 300:
+        raise ValueError('image timeout must be > 0 and <= 300 seconds')
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    with _tempfile_v30.TemporaryDirectory(prefix='sem_v30_image_') as temporary:
+        root = Path(temporary)
+        scratch_annotations = root / 'annotated'
+        request = dict(image_path=str(Path(image_path).resolve()), stage=stage,
+                       condition=str(condition), region=int(region), public_pattern=public_pattern,
+                       v25_pattern_key=v25_pattern_key, ann_dir=str(scratch_annotations),
+                       result_path=str(root / 'result.pkl'))
+        request_path = root / 'request.json'
+        request_path.write_text(_json_v30.dumps(request, ensure_ascii=False), encoding='utf-8')
+        process = _subprocess_v30.Popen([sys.executable, '-u', str(Path(__file__).resolve()),
+                                        '--_v30-worker', str(request_path)])
+        last_progress = started
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise V30ImageTimeout(f'{Path(image_path).name}: exceeded {timeout_seconds:g}s; image skipped')
+                try:
+                    process.wait(timeout=min(1.0, remaining))
+                    break
+                except _subprocess_v30.TimeoutExpired:
+                    now = time.monotonic()
+                    if now - last_progress >= 15:
+                        print(f'    V30 {Path(image_path).name}: elapsed={now-started:.0f}s / {timeout_seconds:g}s', flush=True)
+                        last_progress = now
+            if time.monotonic() > deadline:
+                raise V30ImageTimeout(f'{Path(image_path).name}: exceeded {timeout_seconds:g}s; image skipped')
+            result_path = Path(request['result_path'])
+            if process.returncode != 0 or not result_path.is_file():
+                raise RuntimeError(f'Image worker exited without a result (exit={process.returncode})')
+            # This file is created only by our child in a private temporary directory.
+            with result_path.open('rb') as stream:
+                result = _pickle_v30.load(stream)
+            if not result['ok']:
+                raise RuntimeError(result['error'] + '\n' + result['traceback'])
+            rows, status, rejects, key, trials = result['payload']
+            # Publish annotations only for completed jobs. Timed-out work cannot
+            # leave a partial annotated image that appears to be a valid result.
+            for source in scratch_annotations.rglob('*'):
+                if source.is_file():
+                    destination = Path(ann_dir) / source.relative_to(scratch_annotations)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    _shutil_v30.copy2(source, destination)
+            if status.get('annotated_path'):
+                status['annotated_path'] = str(Path(ann_dir) / Path(status['annotated_path']).relative_to(scratch_annotations))
+            status['processing_elapsed_seconds'] = time.monotonic() - started
+            status['image_timeout_seconds'] = timeout_seconds
+            return rows, status, rejects, key, trials
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except _subprocess_v30.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+
+
+def main_v30(
     before_root: Path,
     after_root: Path,
     output_root: Optional[Path] = None,
     via_pattern_mode: str = "auto",
+    image_timeout_seconds: float = 300.0,
 ):
+    if not math.isfinite(image_timeout_seconds) or not 0 < image_timeout_seconds <= 300:
+        raise ValueError('image_timeout_seconds must be > 0 and <= 300')
     before_root = Path(before_root)
     after_root = Path(after_root)
     # AFTER determines the condition list, including folders missing from BEFORE.
-    conditions = _v29_discover_conditions(after_root)
+    conditions = _v30_discover_conditions(after_root)
     if output_root is None:
-        output_root = after_root.parent / "SEM_0830_0831_compare_V29"
+        output_root = after_root.parent / "SEM_0830_0831_compare_V30"
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -12416,7 +12709,8 @@ def main_v29(
     plot_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 100)
-    print("V29 | matched-count TIF/TIFF/PNG/JPG/JPEG before/after comparison | V25 ONLY")
+    print("V30 | SEM comparison | improved slot recovery + per-image timeout")
+    print(f"Image time limit: {image_timeout_seconds:g}s (including all fallback / via trials)")
     print(f"Before : {before_root}")
     print(f"After  : {after_root}")
     print(f"Output : {output_root}")
@@ -12424,9 +12718,9 @@ def main_v29(
     print(f"Via mode: {via_pattern_mode}")
     print("=" * 100)
 
-    inventory_df, preflight_errors_df = _v29_build_inventory(before_root, after_root, conditions)
-    _v29_write_csv(inventory_df, output_root / "inventory_mapping.csv")
-    _v29_write_csv(preflight_errors_df, output_root / "processing_errors.csv")
+    inventory_df, preflight_errors_df = _v30_build_inventory(before_root, after_root, conditions)
+    _v30_write_csv(inventory_df, output_root / "inventory_mapping.csv")
+    _v30_write_csv(preflight_errors_df, output_root / "processing_errors.csv")
     if not preflight_errors_df.empty:
         for error in preflight_errors_df.to_dict("records"):
             print(f"  PREFLIGHT [{error['error_type']}]: {error['message']}")
@@ -12445,9 +12739,9 @@ def main_v29(
     # Process pair-by-pair so the same auto-selected via40/via60 model is used for
     # BEFORE and AFTER of the corresponding condition + region.
     pair_keys = inventory_df[["condition", "region", "pattern", "pair_key"]].drop_duplicates().copy()
-    _pattern_order_v29 = {p: i for i, p in enumerate(V29_PATTERN_SEQUENCE)}
-    pair_keys["_pattern_order_v29"] = pair_keys["pattern"].map(_pattern_order_v29).fillna(999)
-    pair_keys = _v29_sort_conditions(pair_keys, ["condition", "region", "_pattern_order_v29"]).drop(columns=["_pattern_order_v29"])
+    _pattern_order_v30 = {p: i for i, p in enumerate(V30_PATTERN_SEQUENCE)}
+    pair_keys["_pattern_order_v30"] = pair_keys["pattern"].map(_pattern_order_v30).fillna(999)
+    pair_keys = _v30_sort_conditions(pair_keys, ["condition", "region", "_pattern_order_v30"]).drop(columns=["_pattern_order_v30"])
 
     for _, pk in pair_keys.iterrows():
         condition = str(pk["condition"])
@@ -12456,10 +12750,10 @@ def main_v29(
         pair_key = str(pk["pair_key"])
         pair_inv = inventory_df[inventory_df["pair_key"] == pair_key]
 
-        print(f"\n[{pair_key}] {V29_PATTERN_ZH[pattern]}")
+        print(f"\n[{pair_key}] {V30_PATTERN_ZH[pattern]}")
         stage_paths = {}
         valid = True
-        for stage in V29_STAGES:
+        for stage in V30_STAGES:
             q = pair_inv[pair_inv["stage"] == stage]
             if q.empty:
                 valid = False
@@ -12493,44 +12787,30 @@ def main_v29(
             print("  SKIP: before/after inventory 或 PixelSize 预检不完整")
             continue
 
-        # Fixed keys for trench/slot.
-        if pattern in V29_FIXED_PATTERN_KEY:
-            selected_key = V29_FIXED_PATTERN_KEY[pattern]
+        # Via auto-choice and its winning result share ONE before-image worker
+        # and deadline. AFTER uses the same key only if BEFORE completed.
+        if pattern in V30_FIXED_PATTERN_KEY:
+            selected_key = V30_FIXED_PATTERN_KEY[pattern]
         else:
-            # Via key is chosen from BEFORE only, then frozen for AFTER.
-            before_path = stage_paths["before"]
-            try:
-                selected_key, trials = _v29_choose_via_key_from_before(
-                    before_path, condition, region, trial_root, via_pattern_mode
-                )
-                for t in trials:
-                    t["pair_key"] = pair_key
-                    t["after_image"] = stage_paths["after"].name
-                via_choice_rows.extend(trials)
-                print(f"  Via V25 model selected from BEFORE: {selected_key}")
-            except Exception as exc:
-                processing_errors.append({
-                    "stage": "before",
-                    "condition": condition,
-                    "region": region,
-                    "pattern": "via",
-                    "pair_key": pair_key,
-                    "image": before_path.name,
-                    "path": str(before_path),
-                    "error_type": type(exc).__name__,
-                    "message": f"V25 via40/via60 selection failed: {exc}",
-                    "traceback": _traceback_v29.format_exc(),
-                })
-                print(f"  VIA MODEL ERROR: {type(exc).__name__}: {exc}")
-                continue
+            selected_key = via_pattern_mode if via_pattern_mode in V30_VIA_KEYS else None
 
-        for stage in V29_STAGES:
+        for stage in V30_STAGES:
             image_path = stage_paths[stage]
             ann_dir = ann_root / stage / condition / f"Region_{region}"
             seq_index = int(pair_inv[pair_inv["stage"] == stage].iloc[0]["sequence_index"])
-            print(f"  {V29_STAGE_ZH[stage]} {image_path.name} -> {selected_key}")
+            if pattern == 'via' and stage == 'after' and selected_key is None:
+                note = 'BEFORE did not complete via model selection; matching AFTER skipped.'
+                status_rows.append(dict(stage=stage, condition=condition, region=region,
+                                        pattern=pattern, pair_key=pair_key, image=image_path.name,
+                                        path=str(image_path), status='SKIPPED_VIA_MODEL_UNAVAILABLE', note=note))
+                processing_errors.append(dict(stage=stage, condition=condition, region=region,
+                                               pattern=pattern, pair_key=pair_key, image=image_path.name,
+                                               error_type='VIA_MODEL_UNAVAILABLE', message=note))
+                print(f'  SKIP {image_path.name}: {note}', flush=True)
+                continue
+            print(f"  {V30_STAGE_ZH[stage]} {image_path.name} -> {selected_key}")
             try:
-                rows, status, rejects = _v29_process_v25_assigned(
+                rows, status, rejects, used_key, trials = _v30_process_image_with_timeout(
                     image_path=image_path,
                     stage=stage,
                     condition=condition,
@@ -12538,7 +12818,12 @@ def main_v29(
                     public_pattern=pattern,
                     v25_pattern_key=selected_key,
                     ann_dir=ann_dir,
+                    timeout_seconds=image_timeout_seconds,
                 )
+                selected_key = used_key
+                for trial in trials:
+                    trial.update(pair_key=pair_key, after_image=stage_paths['after'].name)
+                via_choice_rows.extend(trials)
                 for r in rows:
                     r["sequence_index"] = seq_index
                     r["selected_v25_pattern_key"] = selected_key
@@ -12558,45 +12843,50 @@ def main_v29(
                     "image": image_path.name,
                     "path": str(image_path),
                     "selected_v25_pattern_key": selected_key,
-                    "error_type": type(exc).__name__,
+                    "error_type": 'IMAGE_TIMEOUT' if isinstance(exc, V30ImageTimeout) else type(exc).__name__,
                     "message": str(exc),
-                    "traceback": _traceback_v29.format_exc(),
+                    "traceback": _traceback_v30.format_exc(),
                 })
                 status_rows.append({
                     "stage": stage,
-                    "stage_zh": V29_STAGE_ZH[stage],
+                    "stage_zh": V30_STAGE_ZH[stage],
                     "condition": condition,
                     "condition_label": f"Condition {condition}",
                     "region": region,
                     "pair_key": pair_key,
                     "pattern": pattern,
-                    "pattern_zh": V29_PATTERN_ZH[pattern],
+                    "pattern_zh": V30_PATTERN_ZH[pattern],
                     "image": image_path.name,
                     "path": str(image_path),
                     "selected_v25_pattern_key": selected_key,
-                    "source_algorithm": "V25_auto_fallback_only",
-                    "status": "ERROR",
+                    "source_algorithm": "V30_slot_recovery" if pattern == 'slot' else "V25_auto_fallback_only",
+                    "status": "SKIPPED_TIMEOUT" if isinstance(exc, V30ImageTimeout) else "ERROR",
+                    "image_timeout_seconds": image_timeout_seconds,
                     "note": f"{type(exc).__name__}: {exc}",
                 })
-                print(f"    ERROR {type(exc).__name__}: {exc}")
+                label = 'TIMEOUT -> SKIP' if isinstance(exc, V30ImageTimeout) else 'ERROR'
+                print(f"    {label} {type(exc).__name__}: {exc}", flush=True)
+            # Keep completed statuses and skip reasons available during long runs.
+            _v30_write_csv(_v30_df(status_rows), output_root / 'image_status.csv')
+            _v30_write_csv(_v30_df(processing_errors), output_root / 'processing_errors.csv')
 
-    objects_df = _v29_df(all_rows)
-    status_df = _v29_df(status_rows)
-    rejected_df = _v29_df(rejected_rows)
-    errors_df = _v29_df(processing_errors)
-    via_choice_df = _v29_df(via_choice_rows)
+    objects_df = _v30_df(all_rows)
+    status_df = _v30_df(status_rows)
+    rejected_df = _v30_df(rejected_rows)
+    errors_df = _v30_df(processing_errors)
+    via_choice_df = _v30_df(via_choice_rows)
 
     if not objects_df.empty:
         sort_cols = [c for c in ["condition", "region", "pattern", "stage", "image", "object_id"] if c in objects_df.columns]
-        objects_df = _v29_sort_conditions(objects_df, sort_cols)
+        objects_df = _v30_sort_conditions(objects_df, sort_cols)
 
-    image_metrics_df = _v29_build_image_metrics(objects_df)
-    image_pair_df = _v29_build_image_pair_comparison(image_metrics_df)
-    overall_df = _v29_build_overall_comparison(objects_df)
-    object_pair_df = _v29_build_object_comparison(objects_df)
+    image_metrics_df = _v30_build_image_metrics(objects_df)
+    image_pair_df = _v30_build_image_pair_comparison(image_metrics_df)
+    overall_df = _v30_build_overall_comparison(objects_df)
+    object_pair_df = _v30_build_object_comparison(objects_df)
 
     outputs = {
-        "excel": output_root / "SEM_0830_0831_before_after_V29_results.xlsx",
+        "excel": output_root / "SEM_0830_0831_before_after_V30_results.xlsx",
         "inventory": output_root / "inventory_mapping.csv",
         "image_status": output_root / "image_status.csv",
         "all_objects": output_root / "all_object_measurements.csv",
@@ -12610,20 +12900,22 @@ def main_v29(
         "settings": output_root / "settings.json",
     }
 
-    _v29_write_csv(inventory_df, outputs["inventory"])
-    _v29_write_csv(status_df, outputs["image_status"])
-    _v29_write_csv(objects_df, outputs["all_objects"])
-    _v29_write_csv(image_metrics_df, outputs["image_metrics"])
-    _v29_write_csv(image_pair_df, outputs["image_pair_comparison"])
-    _v29_write_csv(overall_df, outputs["overall_comparison"])
-    _v29_write_csv(object_pair_df, outputs["object_comparison"])
-    _v29_write_csv(rejected_df, outputs["rejected_objects"])
-    _v29_write_csv(via_choice_df, outputs["via_model_choice"])
-    _v29_write_csv(errors_df, outputs["errors"])
+    _v30_write_csv(inventory_df, outputs["inventory"])
+    _v30_write_csv(status_df, outputs["image_status"])
+    _v30_write_csv(objects_df, outputs["all_objects"])
+    _v30_write_csv(image_metrics_df, outputs["image_metrics"])
+    _v30_write_csv(image_pair_df, outputs["image_pair_comparison"])
+    _v30_write_csv(overall_df, outputs["overall_comparison"])
+    _v30_write_csv(object_pair_df, outputs["object_comparison"])
+    _v30_write_csv(rejected_df, outputs["rejected_objects"])
+    _v30_write_csv(via_choice_df, outputs["via_model_choice"])
+    _v30_write_csv(errors_df, outputs["errors"])
 
     settings = {
-        "script_version": V29_SCRIPT_VERSION,
-        "algorithm_base": "sem_before_after_compare_V25_auto_fallback.py only",
+        "script_version": V30_SCRIPT_VERSION,
+        "algorithm_base": "V25 trench/via and measurement rules; V30 slot flatfield recovery",
+        "image_timeout_seconds": image_timeout_seconds,
+        "timeout_scope": "one image, including fallback and both BEFORE via model trials; hard subprocess deadline",
         "v1_6_used": False,
         "before_root": str(before_root),
         "after_root": str(after_root),
@@ -12632,8 +12924,8 @@ def main_v29(
         "condition_discovery_rule": "digit-only immediate subfolders of after_root, sorted numerically; match exact names in before_root",
         "condition_name_rule": "preserve leading zeros; ignore before-only folders and nonnumeric folders",
         "regions": sorted(int(r) for r in inventory_df["region"].unique()),
-        "pattern_sequence_per_region": list(V29_PATTERN_SEQUENCE),
-        "supported_image_extensions": sorted(V29_IMAGE_SUFFIXES),
+        "pattern_sequence_per_region": list(V30_PATTERN_SEQUENCE),
+        "supported_image_extensions": sorted(V30_IMAGE_SUFFIXES),
         "required_image_count_per_condition_stage": None,
         "image_count_rule": "equal supported-image counts in corresponding before/after condition folders; formats may differ; no fixed count",
         "pairing_rule": "condition + natural filename order; region/pattern extend in groups of three from Region 2; filenames need not match",
@@ -12642,14 +12934,14 @@ def main_v29(
         "slot_v25_key": "slot210",
         "via_pattern_mode": via_pattern_mode,
         "via_auto_rule": "test V25 via40 and via60 on BEFORE only; select by V25 result quality; freeze same key for AFTER",
-        "metric_specs": V29_METRIC_SPECS,
+        "metric_specs": V30_METRIC_SPECS,
         "accepted_object_count": int(len(objects_df)),
         "image_metric_rows": int(len(image_metrics_df)),
         "image_pair_rows": int(len(image_pair_df)),
         "object_pair_rows": int(len(object_pair_df)),
         "error_or_warning_rows": int(len(errors_df)),
     }
-    outputs["settings"].write_text(_json_v29.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    outputs["settings"].write_text(_json_v30.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
 
     with pd.ExcelWriter(outputs["excel"], engine="openpyxl") as writer:
         inventory_df.to_excel(writer, sheet_name="inventory", index=False)
@@ -12665,10 +12957,10 @@ def main_v29(
         pd.DataFrame([settings]).to_excel(writer, sheet_name="settings", index=False)
         _autofit_excel_v19(writer)
 
-    _v29_save_pair_plots(image_pair_df, plot_dir)
+    _v30_save_pair_plots(image_pair_df, plot_dir)
 
     print("\n" + "=" * 100)
-    print("V29 处理完成")
+    print("V30 处理完成")
     print(f"Accepted objects        : {len(objects_df)}")
     print(f"Image metric rows       : {len(image_metrics_df)}")
     print(f"Image pair compare rows : {len(image_pair_df)}")
@@ -12682,27 +12974,31 @@ def main_v29(
 
 
 # -----------------------------------------------------------------------------
-# V29 CLI
+# V30 CLI
 # -----------------------------------------------------------------------------
-def _v29_build_parser():
-    parser = _argparse_v29.ArgumentParser(
+def _v30_build_parser():
+    parser = _argparse_v30.ArgumentParser(
         description=(
-            "V29: SEM comparison using numeric-named folders discovered under AFTER, "
+            "V30: SEM comparison using numeric-named folders discovered under AFTER, "
             "matched by exact folder name in BEFORE, with equal image counts (TIF/TIFF/PNG/JPG/JPEG). "
-            "Trench, slot and via all use V25 rules only."
+            "V30 improves slot recovery and skips any image exceeding 300 seconds."
         )
     )
     parser.add_argument(
-        "--before", type=Path, default=V29_DEFAULT_BEFORE_ROOT,
-        help=f"处理前根目录；默认：{V29_DEFAULT_BEFORE_ROOT}",
+        "--before", type=Path, default=V30_DEFAULT_BEFORE_ROOT,
+        help=f"处理前根目录；默认：{V30_DEFAULT_BEFORE_ROOT}",
     )
     parser.add_argument(
-        "--after", type=Path, default=V29_DEFAULT_AFTER_ROOT,
-        help=f"处理后根目录；自动识别其纯数字名称子文件夹；默认：{V29_DEFAULT_AFTER_ROOT}",
+        "--after", type=Path, default=V30_DEFAULT_AFTER_ROOT,
+        help=f"处理后根目录；自动识别其纯数字名称子文件夹；默认：{V30_DEFAULT_AFTER_ROOT}",
     )
     parser.add_argument(
         "--output", type=Path, default=None,
-        help="输出目录；默认在两个输入目录同级建立 SEM_0830_0831_compare_V29",
+        help="输出目录；默认在两个输入目录同级建立 SEM_0830_0831_compare_V30",
+    )
+    parser.add_argument(
+        "--image-timeout-seconds", type=float, default=300.0,
+        help="单张图处理上限，含自动补检及 via 模型尝试；默认 300 秒，可设为更短的正数。",
     )
     parser.add_argument(
         "--via-pattern", choices=("auto", "via40", "via60"), default="auto",
@@ -12714,27 +13010,30 @@ def _v29_build_parser():
     return parser
 
 
-def _v29_cli(argv=None) -> int:
-    args = _v29_build_parser().parse_args(argv)
+def _v30_cli(argv=None) -> int:
+    args = _v30_build_parser().parse_args(argv)
     try:
         before_root = Path(args.before)
         after_root = Path(args.after)
-        output_root = Path(args.output) if args.output is not None else after_root.parent / "SEM_0830_0831_compare_V29"
-        main_v29(
+        output_root = Path(args.output) if args.output is not None else after_root.parent / "SEM_0830_0831_compare_V30"
+        main_v30(
             before_root=before_root,
             after_root=after_root,
             output_root=output_root,
             via_pattern_mode=str(args.via_pattern),
+            image_timeout_seconds=float(args.image_timeout_seconds),
         )
         return 0
     except KeyboardInterrupt:
         print("用户中断。", file=sys.stderr)
         return 130
     except Exception as exc:
-        print(f"V29 程序失败：{type(exc).__name__}: {exc}", file=sys.stderr)
-        _traceback_v29.print_exc()
+        print(f"V30 程序失败：{type(exc).__name__}: {exc}", file=sys.stderr)
+        _traceback_v30.print_exc()
         return 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(_v29_cli())
+    if len(sys.argv) == 3 and sys.argv[1] == '--_v30-worker':
+        raise SystemExit(_v30_worker_main(sys.argv[2]))
+    raise SystemExit(_v30_cli())
