@@ -4,6 +4,7 @@
 
 ## 记录索引
 
+- [2026-10-13：V34 宽度与长度 / 间隙默认容差分离](2026-10-13_V34_separate-size-tolerances.md)
 - [2026-10-13：V33 via 质量筛选与尺寸辅助识别](2026-10-13_V33_via-quality-size-hints.md)
 - [2026-10-13：建立 Codex 版本、记录与同步规则](2026-10-13_repo_codex-workflow.md)
 
