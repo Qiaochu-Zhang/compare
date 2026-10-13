@@ -30,3 +30,6 @@ python sem_before_after_compare_0831_V32.py --before "D:/SEM/before" --after "D:
 ```bash
 MPLBACKEND=Agg python -m unittest discover -s tests -v
 ```
+
+Codex 工作规则见 [AGENTS.md](AGENTS.md)：开始工作时按版本号读取最新源码，
+修改后记录到 [md/](md/README.md)，新代码版本完成后生成对应 ZIP，并提交、推送到 GitHub。
