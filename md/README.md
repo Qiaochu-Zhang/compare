@@ -4,6 +4,7 @@
 
 ## 记录索引
 
+- [2026-10-15：V37 完整轮廓复核与弱图案补检](2026-10-15_V37_full-boundary-recovery.md)
 - [2026-10-15：V36 平滑非圆 via 与污染缺失 slit](2026-10-15_V36_morphology-occlusion.md)
 - [2026-10-15：V35 单文件夹样品分析](2026-10-15_V35_single-folder.md)
 - [2026-10-13：V34 宽度与长度 / 间隙默认容差分离](2026-10-13_V34_separate-size-tolerances.md)
