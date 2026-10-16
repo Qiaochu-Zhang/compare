@@ -1,32 +1,31 @@
 # SEM 样品分析与 before/after 对比
 
-当前版本：[V38](SEM_0830_0831_compare_V38_bundle/README_V38.txt)，改善 **V37 相对 V35 的 slit / via 识别回退**，融合两版定位及完整轮廓识别的优点，继续支持单文件夹、before/after 两种模式。
+当前版本：[V39](SEM_0830_0831_compare_V39_bundle/README_V39.txt)，增强**整张图零结果时的识别**，继承 V38 R2 的 slit/via 融合和两种运行模式。
 
-下载 [V38 完整压缩包](SEM_0830_0831_compare_V38_bundle.zip)。解压并进入同名目录，安装依赖：
+下载 [V39 完整压缩包](SEM_0830_0831_compare_V39_bundle.zip)。解压进入同名目录，安装依赖：
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-## V38 识别改进
+## V39 零结果补检
 
-- **slit 完整性按局部横向背景判断**：V37 的大窗口背景平面和单点外探，会把弯曲照明、邻位或模糊尾部误认为轮廓未完整。V38 检查连续外侧前景，减少误拒绝和不必要的尺寸扩张。
-- **首轮可靠定位优先**：沿用 V35 首轮定位顺序；补检独立运行，已有有效轮廓和四排行级优先保留。失败种子恢复同格位原图局部修复，仍须通过原图边缘审核。
-- **完整列可保留，部分列按阵列证据处理**：四排齐全且边缘有效的列不会因其他列缺失被一并删除。部分列继续要求重复阵列支持，缺最下排不测，不提升第三排、不补零。
-- **via 融合 V35 / V37**：首轮可靠孔径优先，补充候选不再把搜索直径拉到孔间碎片尺度；保留首轮径向定位，结合 V37 的弱孔/椭圆整体候选。孔两侧局部背景与连续前景复核减少弯曲照明误判，仍审核原图边缘及异常形貌。
-- trench 继续使用 V37 的局部条体与端点识别。
+- 原流程及既有 L1/L2 补检均没有有效测量后，再做原极性的多尺度原图搜索；已有结果时沿用原流程。
+- 局部响应阈值由噪声以上的有效信号估计，减少小图案占比低时被整图分位数忽略的问题。候选先通过原图边缘与形貌初审，再参与阵列定位。
+- 仍为零时自动尝试相反明暗极性，覆盖明亮目标；每次试验后恢复配置，单图审计记录实际极性与所用方法。
+- via 可从完整、近直角的 2×2 四孔阵列启动；四个孔须全部通过最终原图、形貌和用户尺寸审核。三孔、单排或缺边无法凑成完整二维支撑。
+- 新增补检仍执行原图测量及显式参数，沿用单图 300 秒硬时限。补检结果有复核标记，缺失尺寸不补零。
 
-受控合成对照（表中为有效最下排 slit 数量）：
+受控合成图的完整处理流程对照：
 
-| 场景 | V35 | V37 | V38 |
-| --- | --- | --- | --- |
-| 轻微弯曲背景 | 3 | 0 | 3 |
-| 密集邻位 | 3 | 0 | 3 |
-| 一列完整、其余列缺失较多 | 1 | 0 | 1 |
+| 场景 | V38 R2 有效数 | V39 有效数 |
+| --- | --- | --- |
+| 反向极性 via，20 个孔 | 0 | 20 |
+| 反向极性 slit，3 列四排 | 0 | 3 个最下排 |
+| 反向极性 trench，9 对 | 0 | 9 |
+| 清晰 2×2 via | 0 | 4 |
 
-模糊场景中，真实宽约 17 px，V37 测到约 22 px，V38 恢复到约 16.3–17.6 px；弱下半部的完整轮廓恢复也继续验证。原因、复现参数及边界见 [V38 算法说明](SEM_0830_0831_compare_V38_bundle/ALGORITHM_V38.md)。这些是合成验证，尚无本批真实 SEM 原图/TXT，不能当作实际准确率。
-
-via 的受控合成对照（20 个已知孔）：弯曲背景下 V35 / V37 / 修订 V38 为 **20 / 6 / 20**；密集排列为 **20 / 0 / 20**。后一场景 V37 的搜索直径约 13 px，修订 V38 保留约 39 px 的真实孔尺度。平滑椭圆及弱下半部也继续验证；本次未获得真实 SEM 输入。当前仍为 V38，settings 的版本标识带 `R2`。
+V38 对弯曲背景、密集邻位、弱孔、椭圆及部分缺失 slit 的识别继续验证。没有本批真实 SEM 原图/TXT，以上不能当作真实召回率。实现和限制见 [V39 算法说明](SEM_0830_0831_compare_V39_bundle/ALGORITHM_V39.md)。
 
 ## 单文件夹模式
 
@@ -46,7 +45,7 @@ samples/
 ```
 
 ```bash
-python sem_before_after_compare_0831_V38.py --input "D:/SEM/samples" --output "D:/SEM/single_V38"
+python sem_before_after_compare_0831_V39.py --input "D:/SEM/samples" --output "D:/SEM/single_V39"
 ```
 
 `--input` 自动选择单文件夹模式，也可显式加 `--mode single`。各样品图片数可以不同；编号保留前导零，按数值排序。
@@ -55,17 +54,17 @@ python sem_before_after_compare_0831_V38.py --input "D:/SEM/samples" --output "D
 
 统计作图继续使用六项尺寸指标、nm 单位、均值柱和样本标准差误差棒；slot 只统计边缘有效的完整列最下排，或满足阵列支持要求的部分列最下排。生成单样品各区域图、全部样品区域总览图、合并区域后的样品汇总图。汇总按有效对象计算，n=1 的标准差为空，无有效值不填 0。
 
-主要结果：`SEM_0830_0831_single_V38_results.xlsx`、`sample_metric_summary.csv`、单图统计与对象明细、`annotated/`、`plots/`。单文件夹模式不输出前后配对和差值文件。
+主要结果：`SEM_0830_0831_single_V39_results.xlsx`、`sample_metric_summary.csv`、单图统计与对象明细、`annotated/`、`plots/`。单文件夹模式不输出前后配对和差值文件。
 
 ## before/after 对比（保留）
 
 ```bash
-python sem_before_after_compare_0831_V38.py --before "D:/SEM/before" --after "D:/SEM/after" --output "D:/SEM/compare_V38"
+python sem_before_after_compare_0831_V39.py --before "D:/SEM/before" --after "D:/SEM/after" --output "D:/SEM/compare_V39"
 ```
 
-可显式加 `--mode compare`。从 after 发现数字目录，与 before 完全同名目录匹配；对应目录图片数量须相等，按自然排序配对，文件名和格式可以不同。输出 `SEM_0830_0831_before_after_V38_results.xlsx`，保留图片级、总体及逐对象配对结果与差值图。
+可显式加 `--mode compare`。从 after 发现数字目录，与 before 完全同名目录匹配；对应目录图片数量须相等，按自然排序配对，文件名和格式可以不同。输出 `SEM_0830_0831_before_after_V39_results.xlsx`，保留图片级、总体及逐对象配对结果与差值图。
 
-两种模式的参数不能混用。输出目录必须是新的或空的，重跑请换一个目录名，避免混入旧结果。未指定输出时，single 默认使用输入根目录同级的 `SEM_0830_0831_single_V38`，compare 使用 after 同级的 `SEM_0830_0831_compare_V38`。
+两种模式的参数不能混用。输出目录必须是新的或空的，重跑请换一个目录名，避免混入旧结果。未指定输出时，single 默认使用输入根目录同级的 `SEM_0830_0831_single_V39`，compare 使用 after 同级的 `SEM_0830_0831_compare_V39`。
 
 ## 共同检测参数
 
@@ -91,14 +90,14 @@ python sem_before_after_compare_0831_V38.py --before "D:/SEM/before" --after "D:
 
 ## 使用说明、验证与历史
 
-完整的安装步骤、目录示例、两种模式、全部参数、统计含义、输出字段和故障处理见 [V38 完整使用说明](SEM_0830_0831_compare_V38_bundle/README_V38.txt)，实现说明见 [ALGORITHM_V38.md](SEM_0830_0831_compare_V38_bundle/ALGORITHM_V38.md)，本次修改与交付验证见 [V38 via 补充记录](md/2026-10-16_V38_via-recovery.md)，前轮 slit 分析见 [初次 V38 记录](md/2026-10-16_V38_slit-via-fusion.md)。
+安装、目录示例、参数、统计含义、输出字段及故障处理见 [V39 完整使用说明](SEM_0830_0831_compare_V39_bundle/README_V39.txt)，算法见 [ALGORITHM_V39.md](SEM_0830_0831_compare_V39_bundle/ALGORITHM_V39.md)，修改、回归及 ZIP 校验见 [V39 修改记录](md/2026-10-16_V39_zero-result-recovery.md)。
 
-全仓库 **260 项测试全部通过**，其中 **55 项直接验证 V38**：本轮新增 8 项 via 回退/保留能力测试，加上此前 47 项 V38 场景。完整命令、结果和重打包校验见本次补充记录。本批真实 SEM 原图/TXT 尚未验证。
+全仓库 **288 项测试全部通过**（844.127 秒），其中 **28 项直接验证 V39**，覆盖零结果补检、原有识别能力与完整运行流程。本批真实 SEM 输入及 Windows/macOS 原生运行尚未验证。
 
 ```bash
 MPLBACKEND=Agg python3 -m unittest discover -s tests -v
 ```
 
-历史 [V37 使用说明](SEM_0830_0831_compare_V37_bundle/README_V37.txt)和 [V37 ZIP](SEM_0830_0831_compare_V37_bundle.zip)、[V36 使用说明](SEM_0830_0831_compare_V36_bundle/README_V36.txt)和 [V36 ZIP](SEM_0830_0831_compare_V36_bundle.zip)、[V35 使用说明](SEM_0830_0831_compare_V35_bundle/README_V35.txt)和 [V35 ZIP](SEM_0830_0831_compare_V35_bundle.zip)、[V34 使用说明](SEM_0830_0831_compare_V34_bundle/README_V34.txt)和 [V34 ZIP](SEM_0830_0831_compare_V34_bundle.zip)，以及更早版本目录、ZIP 和上传的 V27/Yakun 包均保留。
+历史 [V38 使用说明](SEM_0830_0831_compare_V38_bundle/README_V38.txt)和 [V38 ZIP](SEM_0830_0831_compare_V38_bundle.zip)、[V37 使用说明](SEM_0830_0831_compare_V37_bundle/README_V37.txt)和 [V37 ZIP](SEM_0830_0831_compare_V37_bundle.zip)、[V36 使用说明](SEM_0830_0831_compare_V36_bundle/README_V36.txt)和 [V36 ZIP](SEM_0830_0831_compare_V36_bundle.zip)、[V35 使用说明](SEM_0830_0831_compare_V35_bundle/README_V35.txt)和 [V35 ZIP](SEM_0830_0831_compare_V35_bundle.zip)、[V34 使用说明](SEM_0830_0831_compare_V34_bundle/README_V34.txt)和 [V34 ZIP](SEM_0830_0831_compare_V34_bundle.zip)，以及更早版本目录、ZIP 和上传的 V27/Yakun 包均保留。
 
 仓库工作规则见 [AGENTS.md](AGENTS.md)，所有修改记录见 [md/](md/README.md)。
