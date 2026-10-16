@@ -4,6 +4,7 @@
 
 ## 记录索引
 
+- [2026-10-16：V38 补充 V35/V37 via 优点融合](2026-10-16_V38_via-recovery.md)
 - [2026-10-16：V38 slit 识别回退分析与分图案改进](2026-10-16_V38_slit-via-fusion.md)
 - [2026-10-15：V37 完整轮廓复核与弱图案补检](2026-10-15_V37_full-boundary-recovery.md)
 - [2026-10-15：V36 平滑非圆 via 与污染缺失 slit](2026-10-15_V36_morphology-occlusion.md)

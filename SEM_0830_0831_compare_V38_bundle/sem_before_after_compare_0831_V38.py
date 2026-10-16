@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SEM analysis V38: preserve reliable slit localization, with pattern-specific edge recovery.
+SEM analysis V38: combine reliable V35 slit/via localization with V37 component recovery.
 Original-gray edge validation, four-row slot morphology and the 300s image limit are retained; individual sites may be missing.
 
 Single mode: --input ROOT; each numeric subfolder is one independent sample.
@@ -12545,6 +12545,39 @@ def _v38_slot_outer_contact(response, contour, noise):
     return float(np.mean(np.all(values > max(1.5, 3.5*noise), axis=1)))
 
 
+def _v38_via_boundary_response(roi, contour):
+    """Interpolate row-local background from both sides of the observed hole.
+
+    Cubic background interpolation accounts for curved illumination without
+    fitting the feature itself. It is localization evidence, never a contour.
+    Limit evidence to the interval bracketed by the sampled shoulders; do not
+    treat an extrapolated polynomial as image evidence.
+    """
+    raw = np.asarray(roi, np.float32)
+    if FEATURE_POLARITY.lower() == 'bright':
+        raw = -raw
+    smooth = cv2.GaussianBlur(raw, (0, 0), .8)
+    points = np.asarray(contour).reshape(-1, 2)
+    lo, hi = float(points[:, 0].min()), float(points[:, 0].max())
+    width = hi-lo+1.
+    margin, band = max(3., min(6., .10*width)), max(5., min(12., .20*width))
+    xx = np.arange(raw.shape[1], dtype=float)
+    left = (xx >= lo-margin-band) & (xx <= lo-margin)
+    right = (xx >= hi+margin) & (xx <= hi+margin+band)
+    if min(np.count_nonzero(left), np.count_nonzero(right)) < 4:
+        return _v32_slot_flatfield_response(roi)
+    columns = left | right
+    u = (xx-.5*(lo+hi))/width
+    design = np.column_stack([u**i for i in range(4)])
+    coefficients = smooth[:, columns] @ np.linalg.pinv(design[columns]).T
+    background = coefficients @ design.T
+    response = np.maximum(background-smooth, 0).astype(np.float32)
+    response[:, (xx < xx[columns].min()) | (xx > xx[columns].max())] = 0
+    residual = raw-smooth
+    noise = 1.4826*float(np.median(np.abs(residual-np.median(residual))))
+    return response, noise
+
+
 def _v37_supported_contour(gray, contour, pattern='unknown'):
     """Re-localize incomplete components before local normal tracking.
 
@@ -12564,10 +12597,13 @@ def _v37_supported_contour(gray, contour, pattern='unknown'):
     if min(roi.shape, default=0) < 9:
         return base, base_audit
     local = points - [x0, y0]
-    # Keep the V37 via path intact. Slits need row-local background and a
-    # connected outward run; a distant dark neighbor or blur tail is not a cap.
+    # Each pattern estimates its local background. A distant dark neighbor or
+    # blur tail alone is not evidence of a truncated boundary.
     if pattern == 'slot':
         response, noise = _v38_slot_boundary_response(roi, local)
+        outer_contact = _v38_slot_outer_contact
+    elif pattern == 'via':
+        response, noise = _v38_via_boundary_response(roi, local)
         outer_contact = _v38_slot_outer_contact
     else:
         response, noise = _v32_slot_flatfield_response(roi)
@@ -12640,6 +12676,8 @@ def _v32_refine_desc(gray, desc, pattern):
     contour, audit = _v37_supported_contour(_v32_raw_gray(gray), desc.contour, pattern)
     if pattern == 'slot':
         audit['slit_boundary_rule'] = 'V38_row_local_connected_outer_foreground'
+    elif pattern == 'via':
+        audit['via_boundary_rule'] = 'V38_bracketed_local_background_and_connected_foreground'
     if contour is None:
         return None, audit
     refined = describe_contour(contour)
@@ -13123,7 +13161,7 @@ def _select_and_measure_bottom_slots_v19(gray, pool, px_nm, image_name, stage, c
     return rows, all_selected, bottom, rejects, meta
 
 
-def _v32_via_search_scale(pool, image_shape, px_nm, pattern_key):
+def _v32_via_search_scale(pool, image_shape, px_nm, pattern_key, prefer_round=False):
     """Estimate a search scale from repeated complete components, including ovals.
 
     The nominal 60 nm identifies the pattern; it is not a measured-CD ceiling.
@@ -13141,7 +13179,13 @@ def _v32_via_search_scale(pool, image_shape, px_nm, pattern_key):
     height, width = image_shape[:2]
     candidates = []
     for desc in pool:
-        if desc is None or not (desc.solidity >= .75 and min(desc.length_px, desc.width_px) >= 4.):
+        if desc is None:
+            continue
+        if prefer_round:
+            shape_ok = desc.solidity >= .70 and desc.circularity >= .35 and desc.aspect <= 1.8
+        else:
+            shape_ok = desc.solidity >= .75 and min(desc.length_px, desc.width_px) >= 4.
+        if not shape_ok:
             continue
         diameter = 2.0 * math.sqrt(max(0., desc.area) / math.pi)
         if not np.isfinite(diameter) or diameter < 6.0 or not _bbox_complete_v19(desc, image_shape, .10):
@@ -13173,11 +13217,29 @@ def _v32_via_search_scale(pool, image_shape, px_nm, pattern_key):
 
 @_v33_pixel_context_for_measurement
 def _select_and_measure_vias_v19(gray, pool, px_nm, image_name, stage, condition, pattern_key):
+    primary_pool = _copy_v32.deepcopy(pool)
+    # Preserve V35's scale from reliable primary near-round objects. Whole
+    # ovals remain a scale source when the near-round pool has too few members.
+    primary_px, primary_meta = _v32_via_search_scale(primary_pool, gray.shape, px_nm, pattern_key,
+                                                   prefer_round=True)
+    primary_scale_rule = ('user_size_hint' if primary_meta['via_search_scale_source'] == 'user_size_hint'
+                          else 'V35_primary_near_round')
+    if primary_meta['via_search_scale_source'] == 'nominal_fallback':
+        primary_px, primary_meta = _v32_via_search_scale(primary_pool, gray.shape, px_nm, pattern_key)
+        primary_scale_rule = 'V37_primary_whole_component'
     local_candidates = _v37_feature_candidates(gray, 'via')
     pool, _ = merge_candidate_descs_v12(_copy_v32.deepcopy(pool), local_candidates, 'via')
-    search_px, scale_meta = _v32_via_search_scale(pool, gray.shape, px_nm, pattern_key)
+    locked = primary_meta['via_search_scale_source'] != 'nominal_fallback'
+    if locked:
+        search_px, scale_meta = primary_px, dict(primary_meta)
+    else:
+        search_px, scale_meta = _v32_via_search_scale(pool, gray.shape, px_nm, pattern_key)
+    scale_meta.update(via_scale_locator=primary_scale_rule if locked else 'V37_supplemental_scale',
+                      v38_via_primary_scale_locked=locked,
+                      v38_via_primary_scale_candidate_count=primary_meta['via_search_scale_candidate_count'])
     rows, selected, rejects, bundle = _V32_VIA_BASE(
-        gray, pool, px_nm, image_name, stage, condition, pattern_key, search_diam_px=search_px)
+        gray, primary_pool, px_nm, image_name, stage, condition, pattern_key, search_diam_px=search_px)
+    primary_count = len(rows)
     component_rows, components, component_rejects, component_model = _v36_via_component_proposals(
         gray, pool, px_nm, image_name, stage, condition, pattern_key, search_px)
     rejects.extend(component_rejects)
@@ -13203,6 +13265,7 @@ def _select_and_measure_vias_v19(gray, pool, px_nm, image_name, stage, condition
         rows = component_rows + [r for _, r in extra]
         bundle['lattice_model'] = component_model
     bundle['meta'].update(scale_meta, v36_observed_component_count=len(components),
+                          v38_via_primary_radial_count=primary_count,
                           v37_local_contrast_candidates=len(local_candidates))
     for row in rows:
         row.update(scale_meta)
@@ -13226,6 +13289,8 @@ def _select_and_measure_vias_v19(gray, pool, px_nm, image_name, stage, condition
             continue
         row = dict(old, v27_x_width_nm=old['x_width_nm'], v27_y_height_nm=old['y_height_nm'], **audit)
         row.update(shape)
+        row['via_locator_path'] = ('V37_observed_component' if hasattr(desc, '_v36_shape_metrics')
+                                   else 'V35_primary_radial')
         row.update(axis_ratio=shape.get('aspect', refined.aspect),
                    via_ellipse_iou=shape.get('ellipse_iou', np.nan), via_radial_cv=shape.get('radial_cv', np.nan))
         accepted.append(refined)
@@ -13532,7 +13597,7 @@ except ImportError as _exc_v32:
     ) from _exc_v32
 
 
-V32_SCRIPT_VERSION = "2026-10-16-V38-SLIT-VIA-FUSION"
+V32_SCRIPT_VERSION = "2026-10-16-V38-SLIT-VIA-FUSION-R2"
 V32_DEFAULT_BEFORE_ROOT = Path(r"C:\Users\z00027644\Documents\倾斜刻蚀\SEM\830SEM_before_treat")
 V32_DEFAULT_AFTER_ROOT = Path(r"C:\Users\z00027644\Documents\倾斜刻蚀\SEM\0831SEM_10-14_topview_after")
 V32_FIRST_REGION = 2
@@ -13825,7 +13890,7 @@ def _v32_process_v25_assigned(
         r["pattern_zh"] = V32_PATTERN_ZH[public_pattern]
         r["region"] = int(region)
         r["pair_key"] = pair_key
-        r["source_algorithm"] = "V38_slit_primary_recovery_V37_via"
+        r["source_algorithm"] = "V38_V35_primary_and_V37_component_recovery"
         r["x_width_nm"] = _v32_finite_float(r.get("x_width_nm"))
         r["y_height_nm"] = _v32_finite_float(r.get("y_height_nm"))
         r["tip_gap_y_nm"] = _v32_finite_float(r.get("tip_gap_y_nm"))
@@ -13839,7 +13904,7 @@ def _v32_process_v25_assigned(
     status["pattern_zh"] = V32_PATTERN_ZH[public_pattern]
     status["region"] = int(region)
     status["pair_key"] = pair_key
-    status["source_algorithm"] = "V38_slit_primary_recovery_V37_via"
+    status["source_algorithm"] = "V38_V35_primary_and_V37_component_recovery"
 
     normalized_rejects: List[dict] = []
     for q0 in rejects:
@@ -13850,7 +13915,7 @@ def _v32_process_v25_assigned(
         q["pattern"] = public_pattern
         q["region"] = int(region)
         q["pair_key"] = pair_key
-        q["source_algorithm"] = "V38_slit_primary_recovery_V37_via"
+        q["source_algorithm"] = "V38_V35_primary_and_V37_component_recovery"
         normalized_rejects.append(q)
 
     return normalized_rows, status, normalized_rejects
@@ -14704,7 +14769,7 @@ def main_v38(
                     "path": str(image_path),
                     "selected_pattern_key": selected_key,
                     "selected_v25_pattern_key": selected_key,
-                    "source_algorithm": "V38_slit_primary_recovery_V37_via",
+                    "source_algorithm": "V38_V35_primary_and_V37_component_recovery",
                     "status": "SKIPPED_TIMEOUT" if isinstance(exc, V32ImageTimeout) else "ERROR",
                     "image_timeout_seconds": image_timeout_seconds,
                     "note": f"{type(exc).__name__}: {exc}",
@@ -14776,7 +14841,9 @@ def main_v38(
         "via_circularity_definition": "4*pi*area/perimeter^2 on final original-gray contour; recorded; default threshold disabled",
         "via_shape_limits": V36_VIA_SHAPE_LIMITS,
         "via_shape_rule": "ellipse-normalized residual and roughness plus solidity/convexity; no circularity, aspect or radial-CV hard gate by default; fitted ellipse is never the measured contour",
-        "via_component_rule": "whole observed components plus legacy radial candidates; one object per observed lattice cell; deduplicate after original-gray refinement",
+        "via_component_rule": "V35 primary radial localization plus V37 whole observed components and local weak candidates; observed lattice cells and original-gray refinement control deduplication",
+        "v38_via_scale_rule": "user hint first; lock repeated primary near-round scale (V35), else primary whole ovals (V37), else supplemental scale; never let supplemental fragments replace reliable primary scale",
+        "v38_via_boundary_rule": "cubic background interpolation bracketed by left/right raw-gray shoulders; no polynomial extrapolation evidence; connected outward foreground; final edges remain raw gray50",
         "slot_array_support_rule": "a fully observed four-row column is sufficient; partial columns require four observed row levels across at least two columns and repeated support in three rows; each measured column includes bottom row and slit_min_column_rows observed rows",
         "slot_missing_site_policy": "missing or unsupported contours are logged; no synthetic contours, dimensions or zero-filled measurements",
         "via_size_outlier_rule": "one same-image median of circularity/prior-valid equivalent diameters; at least 3 peers; never compare BEFORE to AFTER",
